@@ -5,13 +5,9 @@ import Levenshtein
 
 class PDFComparator:
     def __init__(self):
-        # Index: trigram_hash -> list of (source_filename, filtered_word_index)
         self.reference_index = defaultdict(list)
-        # Word index for fuzzy candidate generation: word -> list of (source_filename, filtered_word_index)
         self.word_index = defaultdict(list)
-        # Map: filename -> list of (parts_list, normalized_word) corresponding to filtered_words indices
         self.reference_maps = {}
-
         self.seed_size = 3
         self.merge_distance = 15
         self.STOPWORDS = {
@@ -144,7 +140,7 @@ class PDFComparator:
             "they'd",
             "they'll",
             "they're",
-            "they've",
+            "they_ve",
             "this",
             "those",
             "through",
@@ -237,113 +233,63 @@ class PDFComparator:
         self.reference_index.clear()
         self.word_index.clear()
         self.reference_maps.clear()
-
         for fp in file_paths:
-            try:
-                doc = fitz.open(fp)
-                merged = self._extract_and_dehyphenate(doc)
-                doc.close()
-                filtered = list(self._filter_words_merged(merged))
-
-                # reference_maps stores [(parts, norm_word), ...]
-                self.reference_maps[fp] = [(x[2], x[1]) for x in filtered]
-
-                for idx, norm_word, _ in filtered:
-                    self.word_index[norm_word].append((fp, idx))
-
-                for idx, gram in self._generate_grams(filtered, self.seed_size):
-                    self.reference_index[hash(gram)].append((fp, idx))
-            except Exception as e:
-                print(f"Error reading reference file {fp}: {e}")
+            doc = fitz.open(fp)
+            merged = self._extract_and_dehyphenate(doc)
+            doc.close()
+            filtered = list(self._filter_words_merged(merged))
+            self.reference_maps[fp] = [(x[2], x[1]) for x in filtered]
+            for idx, norm_word, _ in filtered:
+                self.word_index[norm_word].append((fp, idx))
+            for idx, gram in self._generate_grams(filtered, self.seed_size):
+                self.reference_index[hash(gram)].append((fp, idx))
 
     def _run_smith_waterman(self, seq1, seq2):
-        """
-        Runs Smith-Waterman local alignment on two word sequences.
-        Returns a list of indices in seq1 that are part of the alignment.
-        """
         m, n = len(seq1), len(seq2)
         if m == 0 or n == 0:
             return []
-
-        # Scoring
-        match_score = 2
-        mismatch_penalty = -1
-        gap_penalty = -1
-
-        # Initialize matrix
-        # rows: 0..m (seq1), cols: 0..n (seq2)
+        match_score, mismatch_penalty, gap_penalty = 2, -1, -1
         score_matrix = [[0] * (n + 1) for _ in range(m + 1)]
-
-        max_score = 0
-        max_pos = (0, 0)
-
-        # Fill matrix
+        max_score, max_pos = 0, (0, 0)
         for i in range(1, m + 1):
             for j in range(1, n + 1):
-                score_diag = score_matrix[i - 1][j - 1] + (
+                diag = score_matrix[i - 1][j - 1] + (
                     match_score if seq1[i - 1] == seq2[j - 1] else mismatch_penalty
                 )
-                score_up = score_matrix[i - 1][j] + gap_penalty
-                score_left = score_matrix[i][j - 1] + gap_penalty
-
-                score = max(0, score_diag, score_up, score_left)
+                up, left = (
+                    score_matrix[i - 1][j] + gap_penalty,
+                    score_matrix[i][j - 1] + gap_penalty,
+                )
+                score = max(0, diag, up, left)
                 score_matrix[i][j] = score
-
                 if score > max_score:
-                    max_score = score
-                    max_pos = (i, j)
-
+                    max_score, max_pos = score, (i, j)
         if max_score == 0:
             return []
-
-        # Traceback
-        align_indices = []
-        i, j = max_pos
-
+        align_indices, i, j = [], max_pos[0], max_pos[1]
         while i > 0 and j > 0 and score_matrix[i][j] > 0:
-            score = score_matrix[i][j]
-            score_diag = score_matrix[i - 1][j - 1]
-            score_up = score_matrix[i - 1][j]
-            score_left = score_matrix[i][j - 1]
-
-            # Check diagonal (Match/Mismatch)
+            score, score_diag = score_matrix[i][j], score_matrix[i - 1][j - 1]
             is_match = seq1[i - 1] == seq2[j - 1]
-            expected_diag_score = score_diag + (
+            if score == score_diag + (
                 match_score if is_match else mismatch_penalty
-            )
-
-            # Prefer diagonal moves if scores match (greedy match)
-            if score == expected_diag_score or (is_match and score >= score_diag):
+            ) or (is_match and score >= score_diag):
                 if is_match:
-                    align_indices.append(i - 1)  # 0-based index
+                    align_indices.append(i - 1)
+                i, j = i - 1, j - 1
+            elif score == score_matrix[i - 1][j] + gap_penalty:
                 i -= 1
-                j -= 1
-            elif score == score_up + gap_penalty:
-                i -= 1  # Deletion in seq2 (gap in alignment against seq1), skip seq1 word
-            elif score == score_left + gap_penalty:
-                j -= 1  # Insertion in seq2, stay on seq1 word
             else:
-                # Should not happen, but fallback to diagonal
-                i -= 1
                 j -= 1
-
         return sorted(align_indices)
 
     def compare_document(self, target_path, mode="fast", use_sw=True, sw_expansion=1):
-        try:
-            doc = fitz.open(target_path)
-        except:
-            return {}, 0, {}
-
+        doc = fitz.open(target_path)
         merged_target = self._extract_and_dehyphenate(doc)
         doc.close()
         if not merged_target:
             return {}, 0, {}
-
         filtered_target = list(self._filter_words_merged(merged_target))
-        total_words_count = len(merged_target)
         raw_matches = []
-
         if mode == "fast":
             for filt_idx, gram in self._generate_grams(filtered_target, self.seed_size):
                 h = hash(gram)
@@ -357,32 +303,26 @@ class PDFComparator:
                             }
                         )
         else:
-            # Fuzzy Mode using Levenshtein distance on shingles
-            MAX_WORD_DIST = 1
             for filt_idx, target_gram in self._generate_grams(
                 filtered_target, self.seed_size
             ):
-                candidates = defaultdict(int)
+                candidates, target_str = defaultdict(int), " ".join(target_gram)
                 for word in target_gram:
                     for src_fp, src_word_idx in self.word_index.get(word, []):
                         for offset in range(self.seed_size):
-                            shingle_start = src_word_idx - offset
-                            if shingle_start >= 0:
-                                candidates[(src_fp, shingle_start)] += 1
-
-                target_str = " ".join(target_gram)
-                for (src_fp, src_idx), shared_count in candidates.items():
-                    if shared_count >= (self.seed_size - 1):
+                            start = src_word_idx - offset
+                            if start >= 0:
+                                candidates[(src_fp, start)] += 1
+                for (src_fp, src_idx), count in candidates.items():
+                    if count >= (self.seed_size - 1):
                         s_map = self.reference_maps.get(src_fp, [])
                         if src_idx + self.seed_size <= len(s_map):
-                            # Reconstruct source shingle text
-                            src_shingle_words = [
-                                s_map[i][1]
-                                for i in range(src_idx, src_idx + self.seed_size)
-                            ]
-                            src_str = " ".join(src_shingle_words)
-
-                            # Word-level edit distance check
+                            src_str = " ".join(
+                                [
+                                    s_map[i][1]
+                                    for i in range(src_idx, src_idx + self.seed_size)
+                                ]
+                            )
                             if Levenshtein.distance(target_str, src_str) <= 5:
                                 raw_matches.append(
                                     {
@@ -391,15 +331,13 @@ class PDFComparator:
                                         "src_filt_idx": src_idx,
                                     }
                                 )
-
-        # Clustering Logic
         raw_matches.sort(key=lambda x: (x["src_file"], x["target_filt_idx"]))
         merged_blocks = []
         if raw_matches:
-            current_block = None
+            curr = None
             for m in raw_matches:
-                if current_block is None:
-                    current_block = {
+                if curr is None:
+                    curr = {
                         "src": m["src_file"],
                         "start": m["target_filt_idx"],
                         "end": m["target_filt_idx"] + self.seed_size,
@@ -407,86 +345,70 @@ class PDFComparator:
                         "src_start_idx": m["src_filt_idx"],
                     }
                     continue
-                dist_target = m["target_filt_idx"] - current_block["end"]
-                gap_target = m["target_filt_idx"] - (
-                    current_block["end"] - self.seed_size
+                dist, gap_t, gap_s = (
+                    m["target_filt_idx"] - curr["end"],
+                    m["target_filt_idx"] - (curr["end"] - self.seed_size),
+                    m["src_filt_idx"] - curr["last_src_idx"],
                 )
-                gap_src = m["src_filt_idx"] - current_block["last_src_idx"]
                 if (
-                    m["src_file"] == current_block["src"]
-                    and dist_target <= self.merge_distance
-                    and dist_target >= -self.seed_size
-                    and abs(gap_target - gap_src) <= 5
+                    m["src_file"] == curr["src"]
+                    and dist <= self.merge_distance
+                    and dist >= -self.seed_size
+                    and abs(gap_t - gap_s) <= 5
                 ):
-                    current_block["end"] = max(
-                        current_block["end"], m["target_filt_idx"] + self.seed_size
+                    curr["end"], curr["last_src_idx"] = (
+                        max(curr["end"], m["target_filt_idx"] + self.seed_size),
+                        m["src_filt_idx"],
                     )
-                    current_block["last_src_idx"] = m["src_filt_idx"]
                 else:
-                    merged_blocks.append(current_block)
-                    current_block = {
+                    merged_blocks.append(curr)
+                    curr = {
                         "src": m["src_file"],
                         "start": m["target_filt_idx"],
                         "end": m["target_filt_idx"] + self.seed_size,
                         "last_src_idx": m["src_filt_idx"],
                         "src_start_idx": m["src_filt_idx"],
                     }
-            if current_block:
-                merged_blocks.append(current_block)
-
-        final_highlights = defaultdict(list)
-        source_word_counts = defaultdict(set)
-
+            if curr:
+                merged_blocks.append(curr)
+        final_highlights, source_word_counts = defaultdict(list), defaultdict(set)
         for block in merged_blocks:
             if block["end"] - block["start"] < 3:
                 continue
-
-            # Phase B: Smith-Waterman Refinement
-            final_indices = range(block["start"], block["end"])
-            src_start_idx = block["src_start_idx"]
-            src_end_idx = block["src_start_idx"] + (block["end"] - block["start"])
-
+            indices, s_start, s_end = (
+                range(block["start"], block["end"]),
+                block["src_start_idx"],
+                block["src_start_idx"] + (block["end"] - block["start"]),
+            )
             if use_sw:
-                expansion = sw_expansion
-                tgt_start_idx = max(0, block["start"] - expansion)
-                tgt_end_idx = min(len(filtered_target), block["end"] + expansion)
-                target_window_words = [
-                    filtered_target[i][1] for i in range(tgt_start_idx, tgt_end_idx)
-                ]
-
+                exp = sw_expansion
+                t_s, t_e = (
+                    max(0, block["start"] - exp),
+                    min(len(filtered_target), block["end"] + exp),
+                )
                 src_len = block["end"] - block["start"]
-                src_start_win = max(0, block["src_start_idx"] - expansion)
+                s_s_win = max(0, block["src_start_idx"] - exp)
                 s_map = self.reference_maps.get(block["src"], [])
-                src_end_win = min(
-                    len(s_map), block["src_start_idx"] + src_len + expansion
+                s_e_win = min(len(s_map), block["src_start_idx"] + src_len + exp)
+                aligned = self._run_smith_waterman(
+                    [filtered_target[i][1] for i in range(t_s, t_e)],
+                    [s_map[i][1] for i in range(s_s_win, s_e_win)],
                 )
-                source_window_words = [
-                    s_map[i][1] for i in range(src_start_win, src_end_win)
-                ]
-
-                aligned_indices_relative = self._run_smith_waterman(
-                    target_window_words, source_window_words
-                )
-                aligned_indices_global = [
-                    tgt_start_idx + i for i in aligned_indices_relative
-                ]
-
-                if len(aligned_indices_global) > (block["end"] - block["start"]) * 0.5:
-                    final_indices = aligned_indices_global
-                    src_start_idx = src_start_win
-                    src_end_idx = src_end_win
-
+                aligned_g = [t_s + i for i in aligned]
+                if len(aligned_g) > (block["end"] - block["start"]) * 0.5:
+                    indices, s_start, s_end = aligned_g, s_s_win, s_e_win
             source_info = []
             if block["src"] in self.reference_maps:
                 s_map = self.reference_maps[block["src"]]
-                src_start_idx = max(0, min(src_start_idx, len(s_map)))
-                src_end_idx = max(0, min(src_end_idx, len(s_map)))
-                for parts, _ in s_map[src_start_idx:src_end_idx]:
+                s_start, s_end = (
+                    max(0, min(s_start, len(s_map))),
+                    max(0, min(s_end, len(s_map))),
+                )
+                for parts, _ in s_map[s_start:s_end]:
                     for p, r, w in parts:
                         source_info.append((p, r, w))
-
             match_id = id(block)
-            for i in final_indices:
+            for i in indices:
                 if i < len(filtered_target):
                     for p, r, w in filtered_target[i][2]:
                         final_highlights[p].append(
@@ -498,9 +420,11 @@ class PDFComparator:
                             }
                         )
                         source_word_counts[block["src"]].add(i)
-
-        stats = {src: len(indices) for src, indices in source_word_counts.items()}
-        return final_highlights, total_words_count, stats
+        return (
+            final_highlights,
+            len(merged_target),
+            {src: len(idxs) for src, idxs in source_word_counts.items()},
+        )
 
     def get_stats(self):
         return {

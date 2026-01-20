@@ -1,4 +1,4 @@
-from PyQt6.QtCore import QObject, pyqtSignal, QThread
+from PyQt6.QtCore import QObject, pyqtSignal
 
 
 class CompareWorker(QObject):
@@ -17,16 +17,13 @@ class CompareWorker(QObject):
         self.sw_expansion = sw_expansion
 
     def run(self):
-        try:
-            results, total_words, source_stats = self.comparator.compare_document(
-                self.target_path,
-                mode=self.mode,
-                use_sw=self.use_sw,
-                sw_expansion=self.sw_expansion,
-            )
-            self.finished.emit(results, total_words, source_stats)
-        except Exception as e:
-            self.error.emit(str(e))
+        results, total_words, source_stats = self.comparator.compare_document(
+            self.target_path,
+            mode=self.mode,
+            use_sw=self.use_sw,
+            sw_expansion=self.sw_expansion,
+        )
+        self.finished.emit(results, total_words, source_stats)
 
 
 class IndexWorker(QObject):
@@ -39,8 +36,5 @@ class IndexWorker(QObject):
         self.file_paths = file_paths
 
     def run(self):
-        try:
-            self.comparator.add_references(self.file_paths)
-            self.finished.emit()
-        except Exception as e:
-            self.error.emit(str(e))
+        self.comparator.add_references(self.file_paths)
+        self.finished.emit()

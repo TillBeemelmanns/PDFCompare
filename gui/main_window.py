@@ -18,11 +18,11 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QProgressBar,
     QComboBox,
-    QToolBar,
     QApplication,
+    QFrame,
 )
-from PyQt6.QtGui import QImage, QPixmap, QColor, QPalette, QAction
-from PyQt6.QtCore import Qt, QThread
+from PyQt6.QtGui import QImage, QPixmap, QColor, QPalette
+from PyQt6.QtCore import Qt, QThread, QTimer
 
 from compare_logic import PDFComparator
 from gui.widgets import FileListWidget, PDFPageLabel, MiniMapWidget
@@ -38,6 +38,7 @@ class MainWindow(QMainWindow):
         self.status_bar = self.statusBar()
         self.status_bar.showMessage("Ready. Drag and drop PDFs to start.")
         self.comparator = PDFComparator()
+        self.process = psutil.Process(os.getpid())
         self.color_map = {}
         self.colors = [
             QColor(255, 0, 0, 30),
@@ -50,8 +51,12 @@ class MainWindow(QMainWindow):
             QColor(128, 0, 255, 30),
         ]
         self.zoom_level = 1.2
-        self.ignored_match_ids = set()
         self.init_ui()
+
+        # Update stats frequently
+        self.stats_timer = QTimer()
+        self.stats_timer.timeout.connect(self.update_stats)
+        self.stats_timer.start(2000)  # Every 2 seconds
 
     def apply_dark_theme(self):
         palette = QPalette()
@@ -78,14 +83,10 @@ class MainWindow(QMainWindow):
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
 
-        # 1. Config
         gb_config = QGroupBox("Algorithm Parameters")
         gb_layout = QVBoxLayout()
-
-        # Phase A: Matching
         lbl_phase_a = QLabel("<b>Phase A: Matching</b>")
         gb_layout.addWidget(lbl_phase_a)
-
         hbox_seed = QHBoxLayout()
         hbox_seed.addWidget(QLabel("Seed Size (words):"))
         self.spin_seed = QSpinBox()
@@ -93,7 +94,6 @@ class MainWindow(QMainWindow):
         self.spin_seed.setValue(3)
         hbox_seed.addWidget(self.spin_seed)
         gb_layout.addLayout(hbox_seed)
-
         hbox_merge = QHBoxLayout()
         hbox_merge.addWidget(QLabel("Merge Gap (words):"))
         self.spin_merge = QSpinBox()
@@ -101,7 +101,6 @@ class MainWindow(QMainWindow):
         self.spin_merge.setValue(15)
         hbox_merge.addWidget(self.spin_merge)
         gb_layout.addLayout(hbox_merge)
-
         hbox_mode = QHBoxLayout()
         hbox_mode.addWidget(QLabel("Compare Mode:"))
         self.combo_mode = QComboBox()
@@ -109,26 +108,19 @@ class MainWindow(QMainWindow):
         hbox_mode.addWidget(self.combo_mode)
         gb_layout.addLayout(hbox_mode)
 
-        # Phase B: Refinement
         gb_layout.addSpacing(10)
         lbl_phase_b = QLabel("<b>Phase B: Refinement</b>")
         gb_layout.addWidget(lbl_phase_b)
-
         self.chk_sw_refinement = QCheckBox("Enable Smith-Waterman Refinement")
         self.chk_sw_refinement.setChecked(True)
         gb_layout.addWidget(self.chk_sw_refinement)
-
         hbox_expansion = QHBoxLayout()
         hbox_expansion.addWidget(QLabel("Context Lookahead:"))
         self.spin_expansion = QSpinBox()
         self.spin_expansion.setRange(0, 50)
         self.spin_expansion.setValue(1)
-        self.spin_expansion.setToolTip(
-            "Number of extra words to include around a match for fine alignment."
-        )
         hbox_expansion.addWidget(self.spin_expansion)
         gb_layout.addLayout(hbox_expansion)
-
         gb_config.setLayout(gb_layout)
         left_layout.addWidget(gb_config)
 
@@ -161,20 +153,41 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         left_layout.addWidget(self.progress_bar)
 
+        self.current_results = {}
+        self.current_target_file = None
+        self.ignored_match_ids = set()
+
         left_layout.addSpacing(10)
         left_layout.addWidget(QLabel("Legend:"))
         self.legend_layout = QVBoxLayout()
         left_layout.addLayout(self.legend_layout)
 
+        # 5. Statistics
         left_layout.addStretch()
         gb_stats = QGroupBox("Statistics")
         self.stats_layout = QVBoxLayout()
         self.lbl_stats_ngrams = QLabel("N-Grams: 0")
         self.lbl_stats_mem = QLabel("Memory: 0 MB")
+        self.lbl_stats_mem.setToolTip(
+            "Total Resident Set Size (RSS) of the application process."
+        )
         self.stats_layout.addWidget(self.lbl_stats_ngrams)
         self.stats_layout.addWidget(self.lbl_stats_mem)
         gb_stats.setLayout(self.stats_layout)
         left_layout.addWidget(gb_stats)
+
+        # 6. Shortcuts Indicator
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        line.setStyleSheet("background-color: #444;")
+        left_layout.addWidget(line)
+
+        lbl_shortcuts = QLabel(
+            "<b>Shortcuts (Hover match):</b><br>Space: Next Match<br>Mouse Side: Back/Forward"
+        )
+        lbl_shortcuts.setStyleSheet("color: #888; font-size: 10px; padding: 5px;")
+        left_layout.addWidget(lbl_shortcuts)
 
         # Middle Panel (Reference Viewer)
         middle_wrapper = QWidget()
@@ -182,8 +195,6 @@ class MainWindow(QMainWindow):
         h_header = QHBoxLayout()
         self.lbl_source_title = QLabel("<b>Matched Reference Viewer</b>")
         h_header.addWidget(self.lbl_source_title)
-
-        # Zoom Controls Source
         btn_zoom_in_s = QPushButton("+")
         btn_zoom_in_s.setFixedSize(25, 25)
         btn_zoom_in_s.clicked.connect(lambda: self.change_zoom(0.1))
@@ -192,7 +203,6 @@ class MainWindow(QMainWindow):
         btn_zoom_out_s.clicked.connect(lambda: self.change_zoom(-0.1))
         h_header.addWidget(btn_zoom_out_s)
         h_header.addWidget(btn_zoom_in_s)
-
         h_header.addStretch()
         self.btn_prev_match = QPushButton("<")
         self.btn_prev_match.setFixedSize(30, 25)
@@ -230,21 +240,23 @@ class MainWindow(QMainWindow):
         self.source_stack.addWidget(self.source_text_edit)
         middle_layout.addWidget(self.source_stack)
 
-        # Right Panel (Target Viewer)
         right_wrapper = QWidget()
         right_main_layout = QVBoxLayout(right_wrapper)
         h_right_head = QHBoxLayout()
         h_right_head.addWidget(
             QLabel("<b>Target Document</b> (Click highlights to trace)")
         )
-        # Zoom Controls Target (synced via change_zoom)
+        self.chk_hover = QCheckBox("Preview")
+        self.chk_hover.setChecked(True)
+        self.chk_hover.stateChanged.connect(self.toggle_hover_previews)
+        h_right_head.addWidget(self.chk_hover)
+        h_right_head.addStretch()
         btn_zoom_in_t = QPushButton("+")
         btn_zoom_in_t.setFixedSize(25, 25)
         btn_zoom_in_t.clicked.connect(lambda: self.change_zoom(0.1))
         btn_zoom_out_t = QPushButton("-")
         btn_zoom_out_t.setFixedSize(25, 25)
         btn_zoom_out_t.clicked.connect(lambda: self.change_zoom(-0.1))
-        h_right_head.addStretch()
         h_right_head.addWidget(btn_zoom_out_t)
         h_right_head.addWidget(btn_zoom_in_t)
         right_main_layout.addLayout(h_right_head)
@@ -276,14 +288,8 @@ class MainWindow(QMainWindow):
     def change_zoom(self, delta):
         self.zoom_level = max(0.5, min(3.0, self.zoom_level + delta))
         self.status_bar.showMessage(f"Zoom Level: {self.zoom_level:.1f}x", 2000)
-        # Re-render active views
         self.refresh_target_view()
-        if hasattr(self, "current_source_file") and self.current_source_file:
-            # We need to know which matches to highlight in source view.
-            # Currently load_source_view takes specific matches.
-            # If we just re-render, we lose the specific context.
-            # Simple solution: Reload current match if active.
-            self.load_current_match()
+        self.load_current_match()
 
     def scroll_target_to_percent(self, percent):
         bar = self.target_scroll.verticalScrollBar()
@@ -292,96 +298,87 @@ class MainWindow(QMainWindow):
     def update_mini_map_viewport(self):
         bar = self.target_scroll.verticalScrollBar()
         if bar.maximum() > 0:
-            pos = bar.value() / bar.maximum()
-            height = bar.pageStep() / bar.maximum()
-            self.mini_map.set_viewport(pos, height)
+            self.mini_map.set_viewport(
+                bar.value() / bar.maximum(), bar.pageStep() / bar.maximum()
+            )
+
+    def toggle_hover_previews(self):
+        state = self.chk_hover.isChecked()
+        for i in range(self.target_layout.count()):
+            w = self.target_layout.itemAt(i).widget()
+            if isinstance(w, PDFPageLabel):
+                w.show_hover_previews = state
 
     def toggle_source_view(self):
-        if self.btn_toggle_view.isChecked():
-            self.btn_toggle_view.setText("Switch to PDF View")
-            self.source_stack.setCurrentIndex(1)
-        else:
-            self.btn_toggle_view.setText("Switch to Text View")
-            self.source_stack.setCurrentIndex(0)
+        self.source_stack.setCurrentIndex(1 if self.btn_toggle_view.isChecked() else 0)
+        self.btn_toggle_view.setText(
+            "Switch to PDF View"
+            if self.btn_toggle_view.isChecked()
+            else "Switch to Text View"
+        )
 
     def refresh_target_view(self):
-        if (
-            not hasattr(self, "current_results")
-            or not self.current_results
-            or not hasattr(self, "current_target_file")
-            or not self.current_target_file
-        ):
+        if not self.current_results:
             return
-
-        # Get active files from Legend checkboxes
         active_files = set()
         for i in range(self.legend_layout.count()):
-            widget = self.legend_layout.itemAt(i).widget()
-            if isinstance(widget, QCheckBox) and widget.isChecked():
-                active_files.add(widget.property("file_path"))
-
-        filtered_results = {}
-
-        # Filter results by active file AND ignored match IDs
-        for page_idx, matches in self.current_results.items():
-            filtered_matches = [
+            w = self.legend_layout.itemAt(i).widget()
+            if isinstance(w, QCheckBox) and w.isChecked():
+                active_files.add(w.property("file_path"))
+        filtered = {}
+        for p_idx, matches in self.current_results.items():
+            fm = [
                 m
                 for m in matches
                 if m["source"] in active_files
                 and m["match_id"] not in self.ignored_match_ids
             ]
-            if filtered_matches:
-                filtered_results[page_idx] = filtered_matches
-
-        self.render_target(self.current_target_file, filtered_results)
+            if fm:
+                filtered[p_idx] = fm
+        self.render_target(self.current_target_file, filtered)
         self.mini_map.set_data(
-            filtered_results,
+            filtered,
             self.color_map,
             self.current_total_pages,
             getattr(self, "current_page_heights", None),
         )
 
     def run_comparison(self):
-        reference_files = self.reference_list.get_files()
-        target_files = self.target_list.get_files()
-        if not reference_files or not target_files:
+        rf, tf = self.reference_list.get_files(), self.target_list.get_files()
+        if not rf or not tf:
             QMessageBox.warning(self, "Error", "Files missing.")
             return
-
         self.btn_run.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
-        self.comparator.seed_size = self.spin_seed.value()
-        self.comparator.merge_distance = self.spin_merge.value()
+        self.comparator.seed_size, self.comparator.merge_distance = (
+            self.spin_seed.value(),
+            self.spin_merge.value(),
+        )
         self.status_bar.showMessage("Indexing references...")
         self.index_thread = QThread()
-        self.index_worker = IndexWorker(self.comparator, reference_files)
+        self.index_worker = IndexWorker(self.comparator, rf)
         self.index_worker.moveToThread(self.index_thread)
         self.index_thread.started.connect(self.index_worker.run)
         self.index_worker.finished.connect(self.on_index_finished)
-        self.index_worker.error.connect(self.on_error)
         self.index_thread.start()
 
     def on_index_finished(self):
         self.index_thread.quit()
         self.index_thread.wait()
         self.status_bar.showMessage("Comparing document...")
-        target_files = self.target_list.get_files()
         mode = "fast" if self.combo_mode.currentIndex() == 0 else "fuzzy"
-        use_sw = self.chk_sw_refinement.isChecked()
-        sw_expansion = self.spin_expansion.value()
         self.compare_thread = QThread()
         self.compare_worker = CompareWorker(
             self.comparator,
-            target_files[0],
+            self.target_list.get_files()[0],
             mode=mode,
-            use_sw=use_sw,
-            sw_expansion=sw_expansion,
+            use_sw=self.chk_sw_refinement.isChecked(),
+            sw_expansion=self.spin_expansion.value(),
         )
         self.compare_worker.moveToThread(self.compare_thread)
         self.compare_thread.started.connect(self.compare_worker.run)
         self.compare_worker.finished.connect(self.on_compare_finished)
-        self.compare_worker.error.connect(self.on_error)
         self.compare_thread.start()
 
     def on_compare_finished(self, results, total_words, source_stats):
@@ -389,28 +386,25 @@ class MainWindow(QMainWindow):
         self.compare_thread.wait()
         self.btn_run.setEnabled(True)
         self.progress_bar.setVisible(False)
-        self.status_bar.showMessage("Comparison complete.", 5000)
-        self.current_results = results
-        self.current_target_file = self.target_list.get_files()[0]
+        self.current_results, self.current_target_file = (
+            results,
+            self.target_list.get_files()[0],
+        )
         doc = fitz.open(self.current_target_file)
-        self.current_total_pages = len(doc)
-        self.current_page_heights = [page.rect.height for page in doc]
+        self.current_total_pages, self.current_page_heights = (
+            len(doc),
+            [p.rect.height for p in doc],
+        )
         doc.close()
-        self.color_map.clear()
         for i in reversed(range(self.legend_layout.count())):
             self.legend_layout.itemAt(i).widget().setParent(None)
-        reference_files = self.reference_list.get_files()
-        for i, fp in enumerate(reference_files):
+        rf = self.reference_list.get_files()
+        for i, fp in enumerate(rf):
             self.color_map[fp] = self.colors[i % len(self.colors)]
-        sorted_refs = sorted(
-            reference_files, key=lambda x: source_stats.get(x, 0), reverse=True
-        )
-        for fp in sorted_refs:
-            color = self.color_map[fp]
-            match_count = source_stats.get(fp, 0)
-            percent = (match_count / total_words * 100) if total_words > 0 else 0
+        for fp in sorted(rf, key=lambda x: source_stats.get(x, 0), reverse=True):
+            color, mc = self.color_map[fp], source_stats.get(fp, 0)
             chk = QCheckBox(
-                f"{os.path.basename(fp)}: {percent:.1f}% ({match_count} words)"
+                f"{os.path.basename(fp)}: {(mc / total_words * 100) if total_words > 0 else 0:.1f}% ({mc} words)"
             )
             chk.setChecked(True)
             chk.setProperty("file_path", fp)
@@ -422,22 +416,17 @@ class MainWindow(QMainWindow):
         self.refresh_target_view()
         self.update_stats()
 
-    def on_error(self, message):
-        self.btn_run.setEnabled(True)
-        self.progress_bar.setVisible(False)
-        QMessageBox.critical(self, "Error", message)
-
     def update_stats(self):
-        process = psutil.Process(os.getpid())
-        mem_mb = process.memory_info().rss / 1024 / 1024
-        self.lbl_stats_mem.setText(f"Memory: {mem_mb:.1f} MB")
-        idx_stats = self.comparator.get_stats()
-        self.lbl_stats_ngrams.setText(f"Indexed N-Grams: {idx_stats['total_ngrams']}")
+        self.lbl_stats_mem.setText(
+            f"Memory: {self.process.memory_info().rss / 1024 / 1024:.1f} MB"
+        )
+        self.lbl_stats_ngrams.setText(
+            f"Indexed N-Grams: {self.comparator.get_stats()['total_ngrams']}"
+        )
 
     def render_target(self, file_path, results):
         while self.target_layout.count():
-            item = self.target_layout.takeAt(0)
-            w = item.widget()
+            w = self.target_layout.takeAt(0).widget()
             if w:
                 w.deleteLater()
         doc = fitz.open(file_path)
@@ -445,73 +434,73 @@ class MainWindow(QMainWindow):
         mat = fitz.Matrix(zoom, zoom)
         for page_idx, page in enumerate(doc):
             pix = page.get_pixmap(matrix=mat)
-            qimg = QImage(
-                pix.samples,
-                pix.width,
-                pix.height,
-                pix.stride,
-                QImage.Format.Format_RGB888,
-            )
-            page_highlights = []
+            highlights = []
             if page_idx in results:
-                for match in results[page_idx]:
-                    r = match["rect"]
-                    page_highlights.append(
+                for m in results[page_idx]:
+                    highlights.append(
                         {
                             "rect": fitz.Rect(
-                                r.x0 * zoom, r.y0 * zoom, r.x1 * zoom, r.y1 * zoom
+                                m["rect"].x0 * zoom,
+                                m["rect"].y0 * zoom,
+                                m["rect"].x1 * zoom,
+                                m["rect"].y1 * zoom,
                             ),
-                            "source": match["source"],
-                            "source_data": match["source_data"],
+                            "source": m["source"],
+                            "source_data": m["source_data"],
+                            "match_id": m.get("match_id"),
                         }
                     )
-            lbl = PDFPageLabel(QPixmap.fromImage(qimg), page_highlights, self.color_map)
+            lbl = PDFPageLabel(
+                QPixmap.fromImage(
+                    QImage(
+                        pix.samples,
+                        pix.width,
+                        pix.height,
+                        pix.stride,
+                        QImage.Format.Format_RGB888,
+                    )
+                ),
+                highlights,
+                self.color_map,
+            )
+            lbl.show_hover_previews = self.chk_hover.isChecked()
             lbl.matchesClicked.connect(self.handle_matches_clicked)
-            # Connect ignore signal
             lbl.matchIgnored.connect(self.handle_match_ignored)
             self.target_layout.addWidget(lbl)
             self.target_layout.addSpacing(10)
         doc.close()
 
     def handle_match_ignored(self, match):
-        """
-        Globally ignore this specific match block.
-        """
-        match_id = match.get("match_id")
-        if match_id:
-            self.ignored_match_ids.add(match_id)
+        mid = match.get("match_id")
+        if mid:
+            self.ignored_match_ids.add(mid)
             self.status_bar.showMessage("Match block ignored.", 3000)
-
-            # Refresh Target view
             self.refresh_target_view()
-
-            # If the currently viewed reference match was just ignored, clear the reference viewer
             if hasattr(self, "current_match_list") and self.current_match_list:
-                current_m = self.current_match_list[self.current_match_index]
-                if current_m.get("match_id") == match_id:
-                    # Clear reference layout
+                if (
+                    self.current_match_list[self.current_match_index].get("match_id")
+                    == mid
+                ):
                     while self.source_layout.count():
-                        item = self.source_layout.takeAt(0)
-                        w = item.widget()
+                        w = self.source_layout.takeAt(0).widget()
                         if w:
                             w.deleteLater()
                     self.lbl_source_title.setText("<b>Matched Reference Viewer</b>")
                     self.current_match_list = []
 
     def handle_matches_clicked(self, matches):
-        self.current_match_list = matches
-        self.current_match_index = 0
+        self.current_match_list, self.current_match_index = matches, 0
         self.update_match_controls()
         self.load_current_match()
 
     def update_match_controls(self):
-        count = len(self.current_match_list)
-        if count > 1:
+        c = len(self.current_match_list)
+        if c > 1:
             self.btn_prev_match.setVisible(True)
             self.btn_next_match.setVisible(True)
             self.lbl_match_counter.setVisible(True)
             self.lbl_match_counter.setText(
-                f"Match {self.current_match_index + 1} of {count}"
+                f"Match {self.current_match_index + 1} of {c}"
             )
         else:
             self.btn_prev_match.setVisible(False)
@@ -519,87 +508,70 @@ class MainWindow(QMainWindow):
             self.lbl_match_counter.setVisible(False)
 
     def prev_match(self):
-        if not self.current_match_list:
-            return
-        self.current_match_index = (self.current_match_index - 1) % len(
-            self.current_match_list
-        )
-        self.update_match_controls()
-        self.load_current_match()
+        if self.current_match_list:
+            self.current_match_index = (self.current_match_index - 1) % len(
+                self.current_match_list
+            )
+            self.update_match_controls()
+            self.load_current_match()
 
     def next_match(self):
-        if not self.current_match_list:
-            return
-        self.current_match_index = (self.current_match_index + 1) % len(
-            self.current_match_list
-        )
-        self.update_match_controls()
-        self.load_current_match()
+        if self.current_match_list:
+            self.current_match_index = (self.current_match_index + 1) % len(
+                self.current_match_list
+            )
+            self.update_match_controls()
+            self.load_current_match()
 
     def load_current_match(self):
-        if not hasattr(self, "current_match_list") or not self.current_match_list:
-            return
-        m = self.current_match_list[self.current_match_index]
-        self.load_source_view(m["source"], m["source_data"])
+        if hasattr(self, "current_match_list") and self.current_match_list:
+            self.load_source_view(
+                self.current_match_list[self.current_match_index]["source"],
+                self.current_match_list[self.current_match_index]["source_data"],
+            )
 
     def load_source_view(self, file_path, source_data):
         if not source_data:
             return
-        target_page_idx = source_data[0][0]
+        tp = source_data[0][0]
         self.lbl_source_title.setText(
             f"Viewing Reference: <b>{os.path.basename(file_path)}</b>"
         )
         self.status_bar.showMessage(
-            f"Jumped to match in '{os.path.basename(file_path)}' (Page {target_page_idx + 1})",
-            5000,
+            f"Jumped to match in '{os.path.basename(file_path)}' (Page {tp + 1})", 5000
         )
         self.current_source_file = file_path
         while self.source_layout.count():
-            item = self.source_layout.takeAt(0)
-            w = item.widget()
+            w = self.source_layout.takeAt(0).widget()
             if w:
                 w.deleteLater()
-        try:
-            doc = fitz.open(file_path)
-        except:
-            return
-        zoom = self.zoom_level
+        doc = fitz.open(file_path)
+        zoom, tw = self.zoom_level, None
         mat = fitz.Matrix(zoom, zoom)
-        target_widget = None
         full_text = ""
         for page_idx, page in enumerate(doc):
             pix = page.get_pixmap(matrix=mat)
-            qimg = QImage(
-                pix.samples,
-                pix.width,
-                pix.height,
-                pix.stride,
-                QImage.Format.Format_RGB888,
-            )
-            page_rects = [x[1] for x in source_data if x[0] == page_idx]
-            page_rects.sort(key=lambda r: (r.y0, r.x0))
-            merged_rects = []
-            if page_rects:
-                curr_r = page_rects[0]
-                for next_r in page_rects[1:]:
-                    v_overlap = max(
-                        0, min(curr_r.y1, next_r.y1) - max(curr_r.y0, next_r.y0)
-                    )
+            pr = [x[1] for x in source_data if x[0] == page_idx]
+            pr.sort(key=lambda r: (r.y0, r.x0))
+            mr = []
+            if pr:
+                curr = pr[0]
+                for nxt in pr[1:]:
                     if (
-                        v_overlap > (curr_r.y1 - curr_r.y0) * 0.5
-                        and next_r.x0 - curr_r.x1 < 30
+                        max(0, min(curr.y1, nxt.y1) - max(curr.y0, nxt.y0))
+                        > (curr.y1 - curr.y0) * 0.5
+                        and nxt.x0 - curr.x1 < 30
                     ):
-                        curr_r.x1 = max(curr_r.x1, next_r.x1)
+                        curr.x1 = max(curr.x1, nxt.x1)
                     else:
-                        merged_rects.append(curr_r)
-                        curr_r = next_r
-                merged_rects.append(curr_r)
-            highlights = []
-            color = self.color_map.get(file_path, QColor(255, 255, 0, 80))
+                        mr.append(curr)
+                        curr = nxt
+                mr.append(curr)
+            hl, color = [], self.color_map.get(file_path, QColor(255, 255, 0, 80))
             if color.alpha() < 60:
                 color.setAlpha(60)
-            for r in merged_rects:
-                highlights.append(
+            for r in mr:
+                hl.append(
                     {
                         "rect": fitz.Rect(
                             r.x0 * zoom, r.y0 * zoom, r.x1 * zoom, r.y1 * zoom
@@ -608,25 +580,36 @@ class MainWindow(QMainWindow):
                     }
                 )
             lbl = PDFPageLabel(
-                QPixmap.fromImage(qimg), highlights, {"SELECTION": color}
+                QPixmap.fromImage(
+                    QImage(
+                        pix.samples,
+                        pix.width,
+                        pix.height,
+                        pix.stride,
+                        QImage.Format.Format_RGB888,
+                    )
+                ),
+                hl,
+                {"SELECTION": color},
             )
             self.source_layout.addWidget(lbl)
             self.source_layout.addSpacing(10)
-            if page_idx == target_page_idx:
-                target_widget = lbl
+            if page_idx == tp:
+                tw = lbl
             full_text += (
                 f"--- Page {page_idx + 1} ---\n" + page.get_text("text") + "\n\n"
             )
         doc.close()
         self.source_text_edit.setText(full_text)
-        extra = []
-        doc_obj = self.source_text_edit.document()
+        doc_obj, extra = self.source_text_edit.document(), []
         for p_idx in sorted(set(x[0] for x in source_data)):
-            p_words = [x[2] for x in source_data if x[0] == p_idx]
-            hdr = f"--- Page {p_idx + 1} ---"
+            pw, hdr = (
+                [x[2] for x in source_data if x[0] == p_idx],
+                f"--- Page {p_idx + 1} ---",
+            )
             start = doc_obj.find(hdr)
             if not start.isNull():
-                for word in set(p_words):
+                for word in set(pw):
                     if len(word) < 3:
                         continue
                     spos = start.selectionEnd()
@@ -640,8 +623,6 @@ class MainWindow(QMainWindow):
                         extra.append(sel)
                         spos = cur.selectionEnd()
         self.source_text_edit.setExtraSelections(extra)
-        if doc_obj.find(f"--- Page {target_page_idx + 1} ---"):
-            self.source_text_edit.ensureCursorVisible()
-        if target_widget:
-            QApplication.processEvents()
-            self.source_scroll.ensureWidgetVisible(target_widget)
+        if tw:
+            QApplication.instance().processEvents()
+            self.source_scroll.ensureWidgetVisible(tw)

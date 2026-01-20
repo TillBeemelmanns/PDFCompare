@@ -2,14 +2,84 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QLabel,
     QWidget,
-    QListWidgetItem,
     QMenu,
+    QVBoxLayout,
     QApplication,
 )
-from PyQt6.QtGui import QPainter, QColor, QMouseEvent, QAction, QCursor
-from PyQt6.QtCore import Qt, pyqtSignal, QRectF
-import os
+from PyQt6.QtGui import QPainter, QColor, QMouseEvent, QAction, QImage, QPixmap
+from PyQt6.QtCore import Qt, pyqtSignal, QRectF, QSize, QPoint
 import fitz
+
+
+class PreviewPopup(QWidget):
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.WindowType.ToolTip
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint,
+        )
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(2, 2, 2, 2)
+
+        # Image container
+        self.lbl_image = QLabel("Loading...")
+        self.lbl_image.setStyleSheet(
+            "border: 1px solid #555; background: #222; color: #eee;"
+        )
+        self.lbl_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.layout.addWidget(self.lbl_image)
+
+        # Counter label
+        self.lbl_counter = QLabel("")
+        self.lbl_counter.setStyleSheet(
+            "color: #aaa; font-size: 10px; background: rgba(0,0,0,150);"
+        )
+        self.lbl_counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_counter.setFixedSize(60, 15)
+        self.lbl_counter.move(5, 5)  # Will be parented to image label
+        self.lbl_counter.setParent(self.lbl_image)
+
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        self.images = []
+        self.current_idx = 0
+
+    def set_images(self, pixmaps):
+        self.images = pixmaps
+        self.current_idx = 0
+        self.update_display()
+
+    def cycle(self, delta):
+        if not self.images:
+            return
+        self.current_idx = (self.current_idx + delta) % len(self.images)
+        self.update_display()
+
+    def update_display(self):
+        if not self.images:
+            self.set_loading()
+            return
+
+        pix = self.images[self.current_idx]
+        self.lbl_image.setText("")
+        self.lbl_image.setPixmap(pix)
+        self.lbl_image.setFixedSize(pix.size())
+
+        if len(self.images) > 1:
+            self.lbl_counter.setText(f"{self.current_idx + 1} / {len(self.images)}")
+            self.lbl_counter.show()
+        else:
+            self.lbl_counter.hide()
+
+        self.adjustSize()
+
+    def set_loading(self):
+        self.lbl_image.setPixmap(QPixmap())
+        self.lbl_image.setText("Loading Preview...")
+        self.lbl_image.setFixedSize(QSize(200, 50))
+        self.lbl_counter.hide()
+        self.adjustSize()
 
 
 class FileListWidget(QListWidget):
@@ -87,7 +157,10 @@ class FileListWidget(QListWidget):
 
 class PDFPageLabel(QLabel):
     matchesClicked = pyqtSignal(list)
-    matchIgnored = pyqtSignal(object)  # Signal to ignore a match (passed match object)
+    matchIgnored = pyqtSignal(object)
+    show_hover_previews = True
+
+    _popup = None
 
     def __init__(self, pixmap, highlights, color_map, scale_factor=1.0):
         super().__init__()
@@ -98,18 +171,21 @@ class PDFPageLabel(QLabel):
         self.setPixmap(self.original_pixmap)
         self.draw_highlights()
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.current_match_ids = []
+
+        if PDFPageLabel._popup is None:
+            PDFPageLabel._popup = PreviewPopup()
 
     def draw_highlights(self):
         if not self.highlights:
             self.setPixmap(self.original_pixmap)
             return
-
         canvas = self.original_pixmap.copy()
         painter = QPainter(canvas)
         for h in self.highlights:
             if h.get("ignored", False):
                 continue
-
             source = h.get("source", "")
             rect = h["rect"]
             color = self.color_map.get(source, QColor(255, 0, 0, 40))
@@ -124,8 +200,11 @@ class PDFPageLabel(QLabel):
         if not self.highlights:
             super().mouseMoveEvent(event)
             return
+
         pos = event.pos()
         x, y = pos.x(), pos.y()
+
+        # Find ALL matches here
         matches_here = []
         for h in self.highlights:
             if h.get("ignored", False):
@@ -133,22 +212,111 @@ class PDFPageLabel(QLabel):
             r = h["rect"]
             if (r.x0 <= x <= r.x1) and (r.y0 <= y <= r.y1):
                 matches_here.append(h)
+
         if matches_here:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
-            sources = set(
-                os.path.basename(m.get("source", "Unknown")) for m in matches_here
-            )
-            count = len(matches_here)
-            if count > 1:
-                self.setToolTip(f"{count} Matches: {', '.join(sources)}")
+            self.setFocus()  # Grab focus for key events
+            mids = [m.get("match_id") for m in matches_here]
+
+            if self.show_hover_previews:
+                if mids != self.current_match_ids:
+                    self.current_match_ids = mids
+                    self.load_image_previews(matches_here)
+
+                pop_pos = event.globalPosition().toPoint() + QPoint(20, 20)
+                self._popup.move(pop_pos)
+                if not self._popup.isVisible():
+                    self._popup.show()
+                self._popup.raise_()
             else:
-                self.setToolTip(f"Source: {list(sources)[0]}")
+                if self._popup:
+                    self._popup.hide()
+                self.current_match_ids = []
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
-            self.setToolTip("")
+            if self._popup and self._popup.isVisible():
+                self._popup.hide()
+            self.current_match_ids = []
         super().mouseMoveEvent(event)
 
+    def keyPressEvent(self, event):
+        if self._popup and self._popup.isVisible() and len(self.current_match_ids) > 1:
+            if event.key() == Qt.Key.Key_Space:
+                self._popup.cycle(1)
+                return
+        super().keyPressEvent(event)
+
+    def leaveEvent(self, event):
+        if self._popup:
+            self._popup.hide()
+        self.current_match_ids = []
+        super().leaveEvent(event)
+
+    def load_image_previews(self, matches):
+        self._popup.set_loading()
+        pixmaps = []
+
+        for match in matches:
+            source_path = match.get("source")
+            data = match.get("source_data")
+            if not source_path or not data:
+                continue
+
+            page_idx = data[0][0]
+            rects = [fitz.Rect(item[1]) for item in data if item[0] == page_idx]
+            if not rects:
+                continue
+
+            bbox = rects[0]
+            for r in rects[1:]:
+                bbox |= r
+
+            margin = 30
+            bbox.x0 = max(0, bbox.x0 - margin)
+            bbox.y0 = max(0, bbox.y0 - margin)
+            bbox.x1 += margin
+            bbox.y1 += margin
+
+            doc = fitz.open(source_path)
+            page = doc[page_idx]
+            zoom = 1.5
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=bbox)
+            qimg = QImage(
+                pix.samples,
+                pix.width,
+                pix.height,
+                pix.stride,
+                QImage.Format.Format_RGB888,
+            ).copy()
+
+            painter = QPainter(qimg)
+            color = self.color_map.get(source_path, QColor(255, 0, 0, 60))
+            if color.alpha() < 80:
+                color.setAlpha(80)
+            painter.setBrush(color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            for r in rects:
+                rx0 = (r.x0 - bbox.x0) * zoom
+                ry0 = (r.y0 - bbox.y0) * zoom
+                painter.drawRect(QRectF(rx0, ry0, r.width * zoom, r.height * zoom))
+            painter.end()
+
+            pixmaps.append(QPixmap.fromImage(qimg))
+            doc.close()
+
+        self._popup.set_images(pixmaps)
+        QApplication.instance().processEvents()
+
     def mousePressEvent(self, event: QMouseEvent):
+        # Handle secondary mouse buttons for cycling
+        if self._popup and self._popup.isVisible() and len(self.current_match_ids) > 1:
+            if event.button() == Qt.MouseButton.XButton1:  # Back
+                self._popup.cycle(-1)
+                return
+            elif event.button() == Qt.MouseButton.XButton2:  # Forward
+                self._popup.cycle(1)
+                return
+
         if event.button() == Qt.MouseButton.LeftButton:
             if not self.highlights:
                 return
@@ -164,14 +332,11 @@ class PDFPageLabel(QLabel):
                         clicked.append(h)
             if clicked:
                 self.matchesClicked.emit(clicked)
-
         super().mousePressEvent(event)
 
     def contextMenuEvent(self, event):
         pos = event.pos()
         x, y = pos.x(), pos.y()
-
-        # Find match under cursor
         match_under_cursor = None
         for h in self.highlights:
             if h.get("ignored", False):
@@ -180,7 +345,6 @@ class PDFPageLabel(QLabel):
             if (r.x0 <= x <= r.x1) and (r.y0 <= y <= r.y1):
                 match_under_cursor = h
                 break
-
         if match_under_cursor:
             menu = QMenu(self)
             ignore_action = QAction("Ignore this match", self)
@@ -224,21 +388,17 @@ class MiniMapWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(25, 25, 25))
-
         if self.total_pages <= 0 or not self.page_heights:
             return
-
         h = self.height()
         total_doc_height = sum(self.page_heights)
         if total_doc_height <= 0:
             return
-
         y_offsets = []
         curr_offset = 0
         for ph in self.page_heights:
             y_offsets.append(curr_offset)
             curr_offset += ph
-
         for page_idx, matches in self.matches.items():
             if page_idx >= len(y_offsets):
                 continue
@@ -253,7 +413,6 @@ class MiniMapWidget(QWidget):
                 color.setAlpha(200)
                 painter.setPen(color)
                 painter.drawLine(0, y_pixel, self.width(), y_pixel)
-
         painter.setPen(QColor(255, 255, 255, 80))
         painter.setBrush(QColor(255, 255, 255, 20))
         vy = int(self.viewport_pos * h)
