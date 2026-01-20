@@ -55,3 +55,24 @@ To start the application:
 ```bash
 python main.py
 ```
+
+## Development Conventions
+
+*   **Code Style & Linting:** The project uses `ruff` for code formatting and linting. Always check and fix issues before committing.
+    ```bash
+    # Install ruff
+    pip install ruff
+
+    # Format code
+    ruff format .
+
+    # Check and fix linting issues
+    ruff check .
+    ruff check --fix .
+    ```
+*   **Testing:** 
+    *   **Unit Tests:** Run the test suite after any modification to ensure stability.
+        ```bash
+        python -m unittest discover tests
+        ```
+    *   **Manual Verification:** Use sample PDFs to verify GUI interactions (scrolling, highlighting, tooltips).

@@ -30,8 +30,12 @@
     *   Intuitive navigation (Space/Click to cycle, mouse side buttons).
     *   Clear indicators (Loading states, memory stats, shortcuts legend).
 
-## Known Behaviors
+## Workflow Mandates
 
-*   **Scrolling:** Jumping to a page requires a small delay (50ms) to allow the layout to settle, preventing the scroll view from snapping back to the top.
-*   **Memory:** The app monitors its own RSS usage via `psutil`. Image data is the primary consumer; explicit cleanup in `load_source_view` is critical.
-*   **Tooltips:** Tooltips are custom `QWidget` overlays (not standard QTooltip) to support rich content (images) and interactivity.
+*   **Linting:** After modifying code, ALWAYS run:
+    *   `ruff format .`
+    *   `ruff check .` (and `ruff check --fix .` if safe)
+*   **Testing:** After any logic change, ALWAYS run:
+    *   `python -m unittest discover tests`
+*   **Safety:** Explain filesystem operations before execution.
+
