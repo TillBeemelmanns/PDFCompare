@@ -491,9 +491,21 @@ class MainWindow(QMainWindow):
                     self.current_match_list = []
 
     def handle_matches_clicked(self, matches):
-        self.current_match_list, self.current_match_index = matches, 0
-        self.update_match_controls()
-        self.load_current_match()
+        # Check if we clicked the same set of matches (overlapping area)
+        current_ids = [m.get("match_id") for m in matches]
+        last_ids = []
+        if hasattr(self, "current_match_list") and self.current_match_list:
+            last_ids = [m.get("match_id") for m in self.current_match_list]
+
+        if current_ids == last_ids:
+            # Same spot clicked, cycle next
+            self.next_match()
+        else:
+            # New spot, reset
+            self.current_match_list = matches
+            self.current_match_index = 0
+            self.update_match_controls()
+            self.load_current_match()
 
     def update_match_controls(self):
         c = len(self.current_match_list)
