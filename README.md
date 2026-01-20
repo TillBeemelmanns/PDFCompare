@@ -1,6 +1,6 @@
 # PDFCompare
 
-A professional, local desktop application for forensic document comparison. **PDFCompare** allows you to compare a target PDF against a collection of reference documents to identify and visualize text overlaps with high precision.
+A professional, local desktop application for document comparison. **PDFCompare** allows you to compare a target PDF against a collection of reference documents to identify and visualize text overlaps with high precision.
 
 ## Key Features
 
@@ -22,7 +22,7 @@ A professional, local desktop application for forensic document comparison. **PD
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/pdfcompare.git
+    git clone https://github.com/TillBeemelmanns/PDFCompare.git
     cd pdfcompare
     ```
 
