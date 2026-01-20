@@ -1,67 +1,43 @@
 # PDFCompare
 
-A professional, local desktop application for document comparison. **PDFCompare** allows you to compare a target PDF against a collection of reference documents to identify and visualize text overlaps with high precision.
+A professional, local-first forensic plagiarism detection tool.
 
-## Key Features
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 
-*   **100% Offline & Private:** No data ever leaves your machine.
-*   **Dual-Phase Detection:**
-    *   **Phase A (Shingling):** Rapidly identifies potential matches using N-gram indexing.
-    *   **Phase B (Smith-Waterman):** Refines matches using local alignment for optimal boundary detection and gap handling.
-*   **Advanced Visualization:**
-    *   Side-by-side synchronized view.
-    *   High-resolution document Mini-map (Heatmap).
-    *   Interactive highlights (Click to jump to source, cycle overlapping matches).
-*   **Robust Processing:**
-    *   **Fuzzy Matching:** Optional Levenshtein-based matching.
-    *   **De-hyphenation:** Intelligent merging of words split across lines.
-    *   **Multi-threaded:** UI stays responsive during heavy computation.
-*   **Professional UI:** Dark theme, interactive legend, and live statistics (memory/index size).
+## Features
+
+*   **Privacy First:** All processing happens locally on your machine.
+*   **Visual Forensics:** Side-by-side comparison with precise highlighting.
+*   **Advanced Algorithms:** Uses Smith-Waterman alignment to detect rewrites and partial matches.
+*   **Smart Navigation:** Mini-map, tooltips, and click-to-trace functionality.
+*   **Performance:** Optimized for speed and memory efficiency with large documents.
 
 ## Installation
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/TillBeemelmanns/PDFCompare.git
-    cd pdfcompare
-    ```
-
-2.  **Set up a virtual environment:**
+1.  Clone the repository.
+2.  Set up a virtual environment:
     ```bash
     python3 -m venv .venv
     source .venv/bin/activate
     ```
-
-3.  **Install dependencies:**
+3.  Install dependencies:
     ```bash
     pip install -r requirements.txt
     ```
 
 ## Usage
 
-1.  **Run the app:** `python main.py`
-2.  **Load References:** Drag & drop PDFs into the **Reference PDFs** list.
-3.  **Load Target:** Drag & drop the PDF you want to check into the **Target PDF** area.
-4.  **Compare:** Click **Run Comparison**.
-5.  **Analyze:** Use the **Legend** to filter sources, click highlights to trace context, or right-click to ignore specific matches.
-
-## Testing
-
-Run the full test suite with:
-```bash
-python3 -m unittest discover tests
-```
-
-## Tech Stack
-
-*   **GUI:** [PyQt6](https://www.riverbankcomputing.com/software/pyqt/)
-*   **PDF Engine:** [PyMuPDF (fitz)](https://pymupdf.readthedocs.io/)
-*   **Alignment:** Custom Smith-Waterman implementation
-*   **Fuzzy Logic:** [python-Levenshtein](https://github.com/rapidfuzz/python-Levenshtein)
-*   **System Stats:** [psutil](https://github.com/giampaolo/psutil)
+1.  Run `python main.py`.
+2.  Drag and drop your **Reference PDFs** into the left panel.
+3.  Drag and drop your **Target PDF** into the target slot.
+4.  Adjust settings (Seed Size, Compare Mode) if needed.
+5.  Click **Run Comparison**.
+6.  Interact with the results:
+    *   **Hover** to see source previews.
+    *   **Click** to jump to the full context in the Reference Viewer.
+    *   **Space** or **Click Again** to cycle through overlapping matches.
 
 ## License
 
-
-
-MIT License - see [LICENSE](LICENSE) for details.
+MIT
