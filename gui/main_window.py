@@ -51,6 +51,8 @@ class MainWindow(QMainWindow):
             QColor(128, 0, 255, 30),
         ]
         self.zoom_level = 1.2
+        self.last_rendered_source = None
+        self.last_rendered_zoom = None
         self.init_ui()
 
         # Update stats frequently
@@ -540,19 +542,104 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(
             f"Jumped to match in '{os.path.basename(file_path)}' (Page {tp + 1})", 5000
         )
-        self.current_source_file = file_path
-        while self.source_layout.count():
-            w = self.source_layout.takeAt(0).widget()
-            if w:
-                w.deleteLater()
-        doc = fitz.open(file_path)
-        zoom, tw = self.zoom_level, None
-        mat = fitz.Matrix(zoom, zoom)
-        full_text = ""
-        for page_idx, page in enumerate(doc):
-            pix = page.get_pixmap(matrix=mat)
-            pr = [x[1] for x in source_data if x[0] == page_idx]
+
+        should_rerender = (
+            file_path != self.last_rendered_source
+            or self.zoom_level != self.last_rendered_zoom
+        )
+
+        if should_rerender:
+            self.last_rendered_source = file_path
+            self.last_rendered_zoom = self.zoom_level
+
+            doc = fitz.open(file_path)
+            # Optimize: Reuse existing widgets if possible
+            existing_count = self.source_layout.count()
+            needed_count = len(doc)
+
+            # Remove excess
+            while self.source_layout.count() > needed_count:
+                item = self.source_layout.takeAt(self.source_layout.count() - 1)
+                if item.widget():
+                    item.widget().deleteLater()
+
+            zoom = self.zoom_level
+            mat = fitz.Matrix(zoom, zoom)
+            full_text = ""
+
+            for page_idx, page in enumerate(doc):
+                pix = page.get_pixmap(matrix=mat)
+                qimg = QImage(
+                    pix.samples,
+                    pix.width,
+                    pix.height,
+                    pix.stride,
+                    QImage.Format.Format_RGB888,
+                ).copy()
+                pixmap = QPixmap.fromImage(qimg)
+
+                # Check if we have a widget to recycle
+                if page_idx < existing_count:
+                    # Reuse
+                    item = self.source_layout.itemAt(page_idx)
+                    # Use a spacer check just in case, but layout has widgets+spacers
+                    # Actually, we add spacing via addSpacing which adds a spacer item.
+                    # This complicates simple index-based reuse.
+                    # Simpler strategy for memory stability: Clear completely ONLY if document changed.
+                    # If only zoom changed, we could update.
+                    # But given spacer complexity, let's stick to full clear but ensure pixmap release.
+                    pass
+
+            # Re-implementation of clear with explicit pixmap release
+            while self.source_layout.count():
+                item = self.source_layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    if isinstance(w, PDFPageLabel):
+                        w.setPixmap(QPixmap())  # Release memory
+                    w.deleteLater()
+
+            # Render loop (clean)
+            for page_idx, page in enumerate(doc):
+                pix = page.get_pixmap(matrix=mat)
+                lbl = PDFPageLabel(
+                    QPixmap.fromImage(
+                        QImage(
+                            pix.samples,
+                            pix.width,
+                            pix.height,
+                            pix.stride,
+                            QImage.Format.Format_RGB888,
+                        ).copy()
+                    ),
+                    [],
+                    {"SELECTION": QColor(0, 0, 0)},
+                )
+                lbl.page_index = page_idx
+                self.source_layout.addWidget(lbl)
+                self.source_layout.addSpacing(10)
+                full_text += (
+                    f"--- Page {page_idx + 1} ---\n" + page.get_text("text") + "\n\n"
+                )
+            doc.close()
+            self.source_text_edit.setText(full_text)
+
+        # Update Highlights on all pages
+        target_widget = None
+        zoom = self.zoom_level
+        highlight_color = self.color_map.get(file_path, QColor(255, 255, 0, 80))
+        if highlight_color.alpha() < 60:
+            highlight_color.setAlpha(60)
+
+        for i in range(self.source_layout.count()):
+            w = self.source_layout.itemAt(i).widget()
+            if not isinstance(w, PDFPageLabel):
+                continue
+
+            p_idx = w.page_index
+            pr = [x[1] for x in source_data if x[0] == p_idx]
             pr.sort(key=lambda r: (r.y0, r.x0))
+
             mr = []
             if pr:
                 curr = pr[0]
@@ -567,9 +654,8 @@ class MainWindow(QMainWindow):
                         mr.append(curr)
                         curr = nxt
                 mr.append(curr)
-            hl, color = [], self.color_map.get(file_path, QColor(255, 255, 0, 80))
-            if color.alpha() < 60:
-                color.setAlpha(60)
+
+            hl = []
             for r in mr:
                 hl.append(
                     {
@@ -579,34 +665,18 @@ class MainWindow(QMainWindow):
                         "source": "SELECTION",
                     }
                 )
-            lbl = PDFPageLabel(
-                QPixmap.fromImage(
-                    QImage(
-                        pix.samples,
-                        pix.width,
-                        pix.height,
-                        pix.stride,
-                        QImage.Format.Format_RGB888,
-                    )
-                ),
-                hl,
-                {"SELECTION": color},
-            )
-            self.source_layout.addWidget(lbl)
-            self.source_layout.addSpacing(10)
-            if page_idx == tp:
-                tw = lbl
-            full_text += (
-                f"--- Page {page_idx + 1} ---\n" + page.get_text("text") + "\n\n"
-            )
-        doc.close()
-        self.source_text_edit.setText(full_text)
+
+            w.color_map = {"SELECTION": highlight_color}
+            w.highlights = hl
+            w.draw_highlights()
+            if p_idx == tp:
+                target_widget = w
+
+        # Text Edit Highlighting
         doc_obj, extra = self.source_text_edit.document(), []
         for p_idx in sorted(set(x[0] for x in source_data)):
-            pw, hdr = (
-                [x[2] for x in source_data if x[0] == p_idx],
-                f"--- Page {p_idx + 1} ---",
-            )
+            pw = [x[2] for x in source_data if x[0] == p_idx]
+            hdr = f"--- Page {p_idx + 1} ---"
             start = doc_obj.find(hdr)
             if not start.isNull():
                 for word in set(pw):
@@ -623,6 +693,18 @@ class MainWindow(QMainWindow):
                         extra.append(sel)
                         spos = cur.selectionEnd()
         self.source_text_edit.setExtraSelections(extra)
-        if tw:
-            QApplication.instance().processEvents()
-            self.source_scroll.ensureWidgetVisible(tw)
+
+        # Scroll with delay to ensure layout is ready
+        if target_widget:
+            QTimer.singleShot(
+                50, lambda: self.source_scroll.ensureWidgetVisible(target_widget)
+            )
+            hdr_to_find = f"--- Page {tp + 1} ---"
+            cursor = doc_obj.find(hdr_to_find)
+            if not cursor.isNull():
+                QTimer.singleShot(
+                    50, lambda: self.source_text_edit.setTextCursor(cursor)
+                )
+                QTimer.singleShot(
+                    50, lambda: self.source_text_edit.ensureCursorVisible()
+                )
