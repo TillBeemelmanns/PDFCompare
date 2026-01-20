@@ -1,36 +1,39 @@
 # Agent Knowledge Base
 
 ## Overview
-This project is a **Python + PyQt6** desktop application for forensic plagiarism detection. It is designed to be completely offline and privacy-focused.
+This project is a **Python + PyQt6** desktop application for forensic document comparison (PDFCompare). It is designed to be completely offline and privacy-focused.
 
 ## Core Components (Agents)
 
-### 1. `PlagiarismChecker` (`plag_logic.py`)
+### 1. `PDFComparator` (`compare_logic.py`)
 *   **Role:** The "Brain" of the operation.
 *   **Responsibilities:**
     *   **PDF Parsing:** Extracts text and coordinates using `PyMuPDF`.
     *   **De-hyphenation:** Merges split words (e.g., "detec-
-ion") while preserving original coordinates for accurate highlighting.
-    *   **Indexing:** Creates a hash-based inverted index of 3-grams (seeds) from the Pool documents.
-    *   **Matching:** Scans the Suspect document for seeds and clusters them into continuous matching blocks using a gap-tolerant algorithm.
-    *   **Filtering:** Removes stopwords to improve robustness against minor edits.
+tion") while preserving original coordinates.
+    *   **Phase A (Shingling):** Creates an inverted index of 3-grams from Reference documents and identifies candidate regions in the Target.
+    *   **Phase B (Alignment):** Runs Smith-Waterman local alignment on candidate blocks to find optimal match boundaries.
+    *   **Filtering:** Normalizes tokens and removes stopwords to improve robustness.
 
-### 2. `MainWindow` (`main.py`)
+### 2. `MainWindow` (`gui/main_window.py`)
 *   **Role:** The "Interface" and coordinator.
 *   **Responsibilities:**
-    *   **Drag & Drop:** Handles file input via custom `FileListWidget`.
-    *   **Visualization:** Renders PDFs as images and draws colored overlays for matches.
-    *   **Navigation:** Manages the synchronized view between Suspect and Source documents.
-    *   **Interactivity:** Handles clicks on highlights, enabling "drill-down" analysis (jumping to the source context).
-    *   **Filtering:** Allows toggling specific source files on/off via the Legend checkboxes.
+    *   **Orchestration:** Manages background workers (`workers.py`) for indexing and comparison.
+    *   **Visualization:** Coordinates rendering of the Target, Reference, and Mini-map views.
+    *   **Global State:** Tracks ignored match IDs and legend check states to filter the UI.
+    *   **Navigation:** Synchronizes the view when a user clicks a match in the Target document.
+
+### 3. Custom Widgets (`gui/widgets.py`)
+*   **`PDFPageLabel`:** Interactive canvas that renders PDF pages and overlays highlights. Handles clicks and right-click context menus.
+*   **`MiniMapWidget`:** A high-resolution heatmap showing match density across the entire document height.
+*   **`FileListWidget`:** Enhanced list with drag-and-drop support for PDF files.
 
 ## Key Algorithms
 
-*   **Seed-and-Extend:** Matches are found by identifying shared N-grams (seeds) and then extending/clustering them if they appear in a consistent sequence (diagonal match in a dotplot).
-*   **Gap Tolerance:** The clustering logic allows for small gaps or insertions in the text, making it resilient to minor edits.
-*   **De-hyphenation:** A custom pre-processing step ensures that words split across lines are treated as whole words during matching but highlighted as two separate parts in the UI.
+*   **Seed-and-Extend (Phase A):** Rapidly finds potential matches by hashing word shingles (N-grams).
+*   **Smith-Waterman (Phase B):** Provides mathematically optimal local alignment for text sequences, ensuring continuous highlights despite minor gaps or edits.
+*   **Heatmap Coordinate Mapping:** Maps PDF point coordinates to widget pixels across multiple pages to provide an accurate document-wide overview.
 
 ## Future Agents / Extensions
 *   **ReportGenerator:** Could generate HTML/PDF reports of the findings.
 *   **OCRHandler:** Could integrate Tesseract to handle scanned image-only PDFs.
-*   **WebSearcher:** could be added to check against online sources (would break offline promise, so make optional).
