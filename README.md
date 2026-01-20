@@ -45,6 +45,13 @@ A professional, local desktop application for document comparison. **PDFCompare*
 4.  **Compare:** Click **Run Comparison**.
 5.  **Analyze:** Use the **Legend** to filter sources, click highlights to trace context, or right-click to ignore specific matches.
 
+## Testing
+
+Run the full test suite with:
+```bash
+python3 -m unittest discover tests
+```
+
 ## Tech Stack
 
 *   **GUI:** [PyQt6](https://www.riverbankcomputing.com/software/pyqt/)

@@ -37,3 +37,10 @@ tion") while preserving original coordinates.
 ## Future Agents / Extensions
 *   **ReportGenerator:** Could generate HTML/PDF reports of the findings.
 *   **OCRHandler:** Could integrate Tesseract to handle scanned image-only PDFs.
+
+## Testing
+
+The core logic is verified using Python's `unittest` framework. Run the full suite from the root directory:
+```bash
+python3 -m unittest discover tests
+```

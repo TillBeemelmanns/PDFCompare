@@ -87,7 +87,11 @@ python main.py
     # Format code
     ruff format .
     ```
-*   **Testing:** Automated tests are located in the `tests/` directory.
+*   **Testing:** Automated tests are located in the `tests/` directory. Run all tests with:
+    ```bash
+    python3 -m unittest discover tests
+    ```
+    Or run a specific test file:
     ```bash
     ./.venv/bin/python3 tests/test_logic.py
     ```
