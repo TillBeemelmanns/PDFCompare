@@ -1,6 +1,6 @@
 # PDFCompare
 
-A professional, local-first forensic plagiarism detection tool.
+A local-first PDF comparison tool.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
