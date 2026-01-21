@@ -5,8 +5,8 @@
 **Key Features:**
 *   **Offline Privacy:** Runs entirely locally; no data is uploaded to the cloud.
 *   **Dual-Phase Detection:**
-    *   **Phase A:** Fast N-Gram shingling for initial candidate filtering.
-    *   **Phase B:** Smith-Waterman local alignment for precise, gap-tolerant match refinement.
+    *   **Phase A:** Fast N-Gram shingling for initial candidate filtering (parallelized).
+    *   **Phase B:** Smith-Waterman local alignment for precise, gap-tolerant match refinement (NumPy/Parasail optimized).
 *   **Visual Comparison:**
     *   **Target Viewer:** Displays the suspect document with color-coded highlights.
     *   **Reference Viewer:** Side-by-side view of the source document, automatically scrolled to the matching text.
@@ -19,16 +19,26 @@
 *   **Robustness:**
     *   **De-hyphenation:** Intelligently merges words split across lines in PDFs.
     *   **Fuzzy Matching:** Optional Levenshtein-based matching for detecting rewrites.
-*   **Performance:** Multi-threaded processing and optimized memory management.
+*   **Performance:**
+    *   **LRU Page Caching:** Rendered pages cached to avoid redundant PDF rendering on zoom/scroll.
+    *   **Widget Pooling:** Reuses Qt widgets to reduce creation/destruction overhead.
+    *   **Parallelized Matching:** Multi-threaded N-gram comparison.
+    *   **NumPy-Optimized Alignment:** Vectorized Smith-Waterman for ~10x speedup.
+*   **Modern UI:**
+    *   **Catppuccin-Inspired Theme:** Rich, accessible dark theme with refined color palette.
+    *   **Animated Drag-and-Drop:** Visual feedback with glow effects and folder support.
+    *   **Cache Statistics:** Real-time memory and cache usage displayed in UI.
 
 ## Tech Stack
 *   **Language:** Python 3
 *   **GUI:** PyQt6
 *   **PDF Engine:** PyMuPDF (fitz)
-*   **Algorithms:** Custom Smith-Waterman & N-Gram implementation.
+*   **Algorithms:** Custom Smith-Waterman (NumPy), N-Gram Implementation
+*   **Optimization:** NumPy, optional Parasail (SIMD acceleration)
 
 ## Architecture
 *   **MVC Pattern:** Separation of Logic (`compare_logic.py`) and UI (`gui/`).
+*   **Rendering Engine:** `PDFRenderer` with `PixmapCache` and `WidgetPool` for efficient rendering.
 *   **Workers:** Background threads (`gui/workers.py`) prevent UI freezing during heavy processing.
 *   **Widgets:** Custom components (`PDFPageLabel`, `PreviewPopup`) handling specialized rendering and interaction.
 

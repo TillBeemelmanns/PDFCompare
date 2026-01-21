@@ -1,4 +1,11 @@
+# Core dependencies
 PyQt6
 PyMuPDF
 psutil
 python-Levenshtein
+
+# Performance optimizations
+numpy
+
+# Optional: SIMD-accelerated Smith-Waterman (install manually if needed)
+# parasail
