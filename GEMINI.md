@@ -1,8 +1,6 @@
-# Forensic Plagiarism Checker
-
 ## Project Overview
 
-**PDFCompare** is a local desktop application designed for forensic plagiarism detection. It compares a "Target" PDF document against a "Reference Pool" of PDF files to identify and visualize text overlaps.
+**PDFCompare** is a local desktop application designed for PDF comparison. It compares a "Target" PDF document against a "Reference Pool" of PDF files to identify and visualize text overlaps.
 
 **Key Features:**
 *   **Offline Privacy:** Runs entirely locally; no data is uploaded to the cloud.

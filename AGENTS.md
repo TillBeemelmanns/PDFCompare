@@ -1,6 +1,6 @@
 # Agent Guidelines & Context
 
-## Project: PDFCompare (Forensic Plagiarism Checker)
+## Project: PDFCompare 
 
 **Goal:** Maintain and enhance a PyQt6-based desktop application for forensic document comparison. The tool focuses on privacy (local execution), precision (Smith-Waterman algorithm), and user experience (visualizations, interactivity).
 
