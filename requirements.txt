@@ -1,3 +1,4 @@
 PyQt6
 PyMuPDF
 psutil
+python-Levenshtein
