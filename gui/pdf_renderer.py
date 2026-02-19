@@ -302,6 +302,78 @@ class PDFRenderer(QObject):
         """Release all resources."""
         self.pixmap_cache.clear()
 
+    def get_page_dimensions(
+        self, file_path: str, zoom: float
+    ) -> list[tuple[float, float]]:
+        """
+        Open fitz once and return (width_px, height_px) for every page at the given zoom.
+
+        Args:
+            file_path: Path to the PDF file
+            zoom: Zoom level (1.0 = 100%)
+
+        Returns:
+            List of (width_px, height_px) tuples for each page
+        """
+        zoom_key = round(zoom, 2)
+        doc = fitz.open(file_path)
+        dims = []
+        try:
+            for page in doc:
+                rect = page.rect
+                dims.append((rect.width * zoom_key, rect.height * zoom_key))
+        finally:
+            doc.close()
+        return dims
+
+    def batch_prerender(
+        self,
+        file_path: str,
+        page_indices: list,
+        zoom: float,
+        doc=None,
+    ) -> None:
+        """
+        Render all uncached pages from page_indices into the pixmap cache.
+
+        Opens fitz once (or reuses an already-open doc) to avoid N fitz.open() calls.
+
+        Args:
+            file_path: Path to the PDF file
+            page_indices: List of zero-indexed page numbers to prerender
+            zoom: Zoom level
+            doc: Optional already-open fitz.Document to reuse
+        """
+        zoom_key = round(zoom, 2)
+        uncached = [
+            idx
+            for idx in page_indices
+            if self.pixmap_cache.get((file_path, idx, zoom_key)) is None
+        ]
+        if not uncached:
+            return
+
+        should_close = doc is None
+        if doc is None:
+            doc = fitz.open(file_path)
+        try:
+            for page_idx in uncached:
+                page = doc[page_idx]
+                mat = fitz.Matrix(zoom_key, zoom_key)
+                pix = page.get_pixmap(matrix=mat)
+                qimg = QImage(
+                    pix.samples,
+                    pix.width,
+                    pix.height,
+                    pix.stride,
+                    QImage.Format.Format_RGB888,
+                ).copy()
+                pixmap = QPixmap.fromImage(qimg)
+                self.pixmap_cache.put((file_path, page_idx, zoom_key), pixmap)
+        finally:
+            if should_close:
+                doc.close()
+
     def get_cache_stats(self) -> dict:
         """Return cache statistics for debugging."""
         return {

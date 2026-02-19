@@ -356,7 +356,7 @@ class PDFPageLabel(QLabel):
             PDFPageLabel._popup = PreviewPopup()
 
     def draw_highlights(self):
-        if not self.highlights:
+        if not self.highlights or self.original_pixmap.isNull():
             self.setPixmap(self.original_pixmap)
             return
         canvas = self.original_pixmap.copy()
@@ -589,12 +589,14 @@ class MiniMapWidget(QWidget):
         self.page_heights = []
         self.viewport_pos = 0.0
         self.viewport_height = 0.1
+        self._lines_cache: QPixmap | None = None  # Pre-rendered match markers
 
     def set_data(self, matches, color_map, total_pages, page_heights=None):
         self.matches = matches
         self.color_map = color_map
         self.total_pages = max(1, total_pages)
         self.page_heights = page_heights or [800.0] * self.total_pages
+        self._lines_cache = None  # Invalidate on data change
         self.update()
 
     def set_viewport(self, pos, height):
@@ -602,20 +604,21 @@ class MiniMapWidget(QWidget):
         self.viewport_height = height
         self.update()
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    def resizeEvent(self, event):
+        self._lines_cache = None  # Invalidate on resize
+        super().resizeEvent(event)
 
-        # Modern gradient background
-        gradient = QLinearGradient(0, 0, self.width(), 0)
-        gradient.setColorAt(0, QColor(30, 30, 46))
-        gradient.setColorAt(1, QColor(24, 24, 37))
-        painter.fillRect(self.rect(), gradient)
+    def _build_lines_cache(self) -> None:
+        """Pre-render all match markers into a QPixmap so paintEvent is cheap."""
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+        self._lines_cache = QPixmap(w, h)
+        self._lines_cache.fill(Qt.GlobalColor.transparent)
 
-        if self.total_pages <= 0 or not self.page_heights:
+        if not self.matches or not self.page_heights:
             return
 
-        h = self.height()
         total_doc_height = sum(self.page_heights)
         if total_doc_height <= 0:
             return
@@ -626,7 +629,7 @@ class MiniMapWidget(QWidget):
             y_offsets.append(curr_offset)
             curr_offset += ph
 
-        # Draw match markers
+        painter = QPainter(self._lines_cache)
         for page_idx, matches in self.matches.items():
             if page_idx >= len(y_offsets):
                 continue
@@ -635,19 +638,39 @@ class MiniMapWidget(QWidget):
                 if m.get("ignored", False):
                     continue
                 r = m["rect"]
-                abs_y_pts = page_base_y + r.y0
-                y_pixel = int((abs_y_pts / total_doc_height) * h)
-
+                y_pixel = int(((page_base_y + r.y0) / total_doc_height) * h)
                 color = QColor(self.color_map.get(m["source"], QColor(255, 0, 0)))
                 color.setAlpha(220)
-
-                # Draw slightly thicker lines for visibility
                 pen = QPen(color)
                 pen.setWidth(2)
                 painter.setPen(pen)
-                painter.drawLine(2, y_pixel, self.width() - 2, y_pixel)
+                painter.drawLine(2, y_pixel, w - 2, y_pixel)
+        painter.end()
 
-        # Draw viewport indicator with modern styling
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Background gradient
+        gradient = QLinearGradient(0, 0, self.width(), 0)
+        gradient.setColorAt(0, QColor(30, 30, 46))
+        gradient.setColorAt(1, QColor(24, 24, 37))
+        painter.fillRect(self.rect(), gradient)
+
+        if self.total_pages <= 0 or not self.page_heights:
+            return
+
+        h = self.height()
+
+        # Build cache on first paint after data/resize change
+        if self._lines_cache is None:
+            self._build_lines_cache()
+
+        # Blit the pre-rendered match markers (single drawPixmap, no per-match work)
+        if self._lines_cache is not None:
+            painter.drawPixmap(0, 0, self._lines_cache)
+
+        # Viewport indicator — only dynamic element, drawn fresh each frame
         painter.setPen(QPen(QColor(205, 214, 244, 100), 1))
         painter.setBrush(QColor(205, 214, 244, 30))
         vy = int(self.viewport_pos * h)
