@@ -360,6 +360,10 @@ class MainWindow(QMainWindow):
         self.spin_seed = QSpinBox()
         self.spin_seed.setRange(2, 10)
         self.spin_seed.setValue(3)
+        self.spin_seed.setToolTip(
+            "Minimum number of consecutive words that must match to form a\n"
+            "candidate block. Higher = fewer but more reliable matches."
+        )
         hbox_seed.addWidget(self.spin_seed)
         gb_layout.addLayout(hbox_seed)
 
@@ -368,6 +372,10 @@ class MainWindow(QMainWindow):
         self.spin_merge = QSpinBox()
         self.spin_merge.setRange(0, 100)
         self.spin_merge.setValue(15)
+        self.spin_merge.setToolTip(
+            "Maximum word gap between two adjacent matches that will be\n"
+            "merged into a single block. Higher = fewer, larger blocks."
+        )
         hbox_merge.addWidget(self.spin_merge)
         gb_layout.addLayout(hbox_merge)
 
@@ -375,6 +383,10 @@ class MainWindow(QMainWindow):
         hbox_mode.addWidget(QLabel("Compare Mode:"))
         self.combo_mode = QComboBox()
         self.combo_mode.addItems(["Fast (Exact N-Gram)", "Fuzzy (Levenshtein)"])
+        self.combo_mode.setToolTip(
+            "Fast: exact n-gram matching — best for identical or near-identical text.\n"
+            "Fuzzy: Levenshtein distance allows minor typos and OCR errors (slower)."
+        )
         hbox_mode.addWidget(self.combo_mode)
         gb_layout.addLayout(hbox_mode)
 
@@ -385,6 +397,11 @@ class MainWindow(QMainWindow):
 
         self.chk_sw_refinement = QCheckBox("Enable Smith-Waterman Refinement")
         self.chk_sw_refinement.setChecked(True)
+        self.chk_sw_refinement.setToolTip(
+            "Refines n-gram candidates with Smith-Waterman local alignment.\n"
+            "Produces precise match boundaries and a confidence score (0–1).\n"
+            "Disable for a faster but coarser result."
+        )
         gb_layout.addWidget(self.chk_sw_refinement)
 
         hbox_expansion = QHBoxLayout()
@@ -392,6 +409,11 @@ class MainWindow(QMainWindow):
         self.spin_expansion = QSpinBox()
         self.spin_expansion.setRange(0, 50)
         self.spin_expansion.setValue(1)
+        self.spin_expansion.setToolTip(
+            "Extra words inspected beyond each n-gram match boundary when\n"
+            "running Smith-Waterman. Helps capture leading/trailing context\n"
+            "that the n-gram phase may have clipped."
+        )
         hbox_expansion.addWidget(self.spin_expansion)
         gb_layout.addLayout(hbox_expansion)
 
@@ -454,6 +476,13 @@ class MainWindow(QMainWindow):
         self.progress_bar.setTextVisible(True)
         left_layout.addWidget(self.progress_bar)
 
+        # Clear Results button
+        self.btn_clear = QPushButton("✕  Clear Results")
+        self.btn_clear.setEnabled(False)
+        self.btn_clear.setToolTip("Remove comparison results and reset both viewers.")
+        self.btn_clear.clicked.connect(self.clear_results)
+        left_layout.addWidget(self.btn_clear)
+
         left_layout.addSpacing(10)
 
         # Legend
@@ -468,12 +497,14 @@ class MainWindow(QMainWindow):
         self.lbl_stats_ngrams = QLabel("N-Grams: 0")
         self.lbl_stats_mem = QLabel("Memory: 0 MB")
         self.lbl_stats_cache = QLabel("Cache: 0 pages")
+        self.lbl_stats_matches = QLabel("Matches: —")
         self.lbl_stats_mem.setToolTip(
             "Total Resident Set Size (RSS) of the application process."
         )
         self.stats_layout.addWidget(self.lbl_stats_ngrams)
         self.stats_layout.addWidget(self.lbl_stats_mem)
         self.stats_layout.addWidget(self.lbl_stats_cache)
+        self.stats_layout.addWidget(self.lbl_stats_matches)
         gb_stats.setLayout(self.stats_layout)
         left_layout.addWidget(gb_stats)
 
@@ -575,11 +606,6 @@ class MainWindow(QMainWindow):
             QLabel("<b>Target Document</b> (Click highlights to trace)")
         )
 
-        self.chk_hover = QCheckBox("Preview")
-        self.chk_hover.setChecked(True)
-        self.chk_hover.stateChanged.connect(self.toggle_hover_previews)
-        h_right_head.addWidget(self.chk_hover)
-
         self.chk_minimap = QCheckBox("Map")
         self.chk_minimap.setChecked(True)
         self.chk_minimap.stateChanged.connect(self._toggle_minimap)
@@ -648,13 +674,6 @@ class MainWindow(QMainWindow):
         self.mini_map.setVisible(visible)
         if visible:
             self.update_mini_map_viewport()
-
-    def toggle_hover_previews(self):
-        state = self.chk_hover.isChecked()
-        for i in range(self.target_layout.count()):
-            w = self.target_layout.itemAt(i).widget()
-            if isinstance(w, PDFPageLabel):
-                w.show_hover_previews = state
 
     def toggle_source_view(self):
         self.source_stack.setCurrentIndex(1 if self.btn_toggle_view.isChecked() else 0)
@@ -810,11 +829,22 @@ class MainWindow(QMainWindow):
             """)
             self.legend_layout.addWidget(chk)
 
+        self.btn_clear.setEnabled(True)
+
+        n_matches = sum(len(m) for m in results.values())
+        overlap_pct = (
+            (sum(source_stats.values()) / total_words * 100) if total_words > 0 else 0.0
+        )
+        self.lbl_stats_matches.setText(
+            f"Matches: {n_matches} blocks / {overlap_pct:.1f}% overlap"
+        )
+
         self.refresh_target_view()
         self.update_stats()
         self.status_bar.showMessage(
-            f"Comparison complete. Found matches from {len(source_stats)} sources.",
-            5000,
+            f"Done. {n_matches} match blocks from {len(source_stats)} source(s)"
+            f" — {overlap_pct:.1f}% overlap.",
+            8000,
         )
 
     def update_stats(self):
@@ -919,7 +949,6 @@ class MainWindow(QMainWindow):
                 lbl = PDFPageLabel(QPixmap(), highlights, self.color_map)
 
             lbl.page_index = page_idx
-            lbl.show_hover_previews = self.chk_hover.isChecked()
             lbl.matchesClicked.connect(self.handle_matches_clicked)
             lbl.matchIgnored.connect(self.handle_match_ignored)
             # Fixed size keeps layout stable when pixmap is cleared
@@ -1101,6 +1130,67 @@ class MainWindow(QMainWindow):
         lbl._hl_cache = None
         lbl._hl_cache_key = None
         self._source_page_slot_data[slot_idx]["materialized"] = False
+
+    def clear_results(self):
+        """Reset both viewers and all comparison state without clearing file lists."""
+        # Stop any in-flight work
+        if self._pending_bg_render_worker is not None:
+            self._pending_bg_render_worker.cancel()
+            self._pending_bg_render_worker = None
+        self._refresh_timer.stop()
+
+        # Reset state
+        self.current_results = {}
+        self.current_target_file = None
+        self.current_match_list = []
+        self.current_match_index = 0
+        self.ignored_match_ids = set()
+        self.last_rendered_source = None
+        self.last_rendered_zoom = None
+        self._page_slots = []
+        self._page_slot_data = []
+        self._source_page_slots = []
+        self._source_page_slot_data = []
+
+        # Drain target layout and discard pool
+        while self.target_layout.count():
+            item = self.target_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.widget_pool.clear()
+
+        # Drain source layout
+        while self.source_layout.count():
+            item = self.source_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        # Clear legend
+        for i in reversed(range(self.legend_layout.count())):
+            self.legend_layout.itemAt(i).widget().setParent(None)
+
+        # Reset minimap
+        self.mini_map.set_data({}, {}, 1, None)
+
+        # Hide match navigation controls
+        self.btn_prev_match.setVisible(False)
+        self.btn_next_match.setVisible(False)
+        self.lbl_match_counter.setVisible(False)
+
+        # Reset source title
+        self.lbl_source_title.setText("<b>Matched Reference Viewer</b>")
+
+        # Invalidate render caches
+        self.target_renderer.invalidate_cache()
+        self.source_renderer.invalidate_cache()
+
+        # Update UI state
+        self.btn_clear.setEnabled(False)
+        self.lbl_stats_matches.setText("Matches: —")
+        self.update_stats()
+        self.status_bar.showMessage("Results cleared.", 3000)
 
     def handle_match_ignored(self, match):
         mid = match.get("match_id")
