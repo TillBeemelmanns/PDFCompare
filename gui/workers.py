@@ -195,3 +195,57 @@ def get_preview_pool() -> QThreadPool:
         _preview_pool = QThreadPool()
         _preview_pool.setMaxThreadCount(2)  # Limit concurrent previews
     return _preview_pool
+
+
+class PageRenderWorkerSignals(QObject):
+    """Signals for PageRenderWorker."""
+
+    # list of (page_idx: int, image: QImage), plus the zoom the render was for
+    finished = pyqtSignal(list, float)
+
+
+class PageRenderWorker(QRunnable):
+    """
+    Background worker that rasterises a set of PDF pages into QImage objects.
+
+    Uses QImage (thread-safe) rather than QPixmap; the caller converts to
+    QPixmap on the main thread via _on_bg_pages_rendered.
+    """
+
+    def __init__(self, file_path: str, page_indices: list, zoom: float):
+        super().__init__()
+        self.file_path = file_path
+        self.page_indices = page_indices
+        self.zoom = round(zoom, 2)
+        self.signals = PageRenderWorkerSignals()
+        self._cancelled = False
+        self.setAutoDelete(True)
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        if self._cancelled:
+            return
+
+        results = []
+        doc = fitz.open(self.file_path)
+        try:
+            mat = fitz.Matrix(self.zoom, self.zoom)
+            for page_idx in self.page_indices:
+                if self._cancelled:
+                    return
+                pix = doc[page_idx].get_pixmap(matrix=mat)
+                qimg = QImage(
+                    pix.samples,
+                    pix.width,
+                    pix.height,
+                    pix.stride,
+                    QImage.Format.Format_RGB888,
+                ).copy()  # detach from fitz buffer
+                results.append((page_idx, qimg))
+        finally:
+            doc.close()
+
+        if not self._cancelled:
+            self.signals.finished.emit(results, self.zoom)

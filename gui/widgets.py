@@ -345,6 +345,9 @@ class PDFPageLabel(QLabel):
         self.color_map = color_map
         self.scale_factor = scale_factor
         self.page_index = 0
+        # Highlight-render cache: avoids redrawing when inputs haven't changed
+        self._hl_cache: QPixmap | None = None
+        self._hl_cache_key: tuple | None = None
         self.setPixmap(self.original_pixmap)
         self.draw_highlights()
         self.setMouseTracking(True)
@@ -358,7 +361,17 @@ class PDFPageLabel(QLabel):
     def draw_highlights(self):
         if not self.highlights or self.original_pixmap.isNull():
             self.setPixmap(self.original_pixmap)
+            self._hl_cache = None
+            self._hl_cache_key = None
             return
+
+        # Return cached result when neither the highlight list nor the base
+        # pixmap object has changed since the last paint.
+        cache_key = (id(self.highlights), id(self.original_pixmap))
+        if cache_key == self._hl_cache_key and self._hl_cache is not None:
+            self.setPixmap(self._hl_cache)
+            return
+
         canvas = self.original_pixmap.copy()
         painter = QPainter(canvas)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -370,10 +383,11 @@ class PDFPageLabel(QLabel):
             rect = h["rect"]
             base_color = self.color_map.get(source, QColor(255, 0, 0, 40))
 
-            # Adjust opacity based on confidence (0.0-1.0)
+            # Adjust opacity based on confidence (0.0-1.0).
+            # Keep alpha low so underlying text remains legible.
             confidence = h.get("confidence", 0.7)
-            # Map confidence to alpha: 30 (low) to 120 (high)
-            alpha = int(30 + confidence * 90)
+            # Map confidence to alpha: 25 (low) to 70 (high)
+            alpha = int(25 + confidence * 45)
             color = QColor(
                 base_color.red(), base_color.green(), base_color.blue(), alpha
             )
@@ -384,7 +398,7 @@ class PDFPageLabel(QLabel):
             # Draw border for high-confidence matches (>80%)
             if confidence >= 0.8:
                 border_color = QColor(
-                    base_color.red(), base_color.green(), base_color.blue(), 200
+                    base_color.red(), base_color.green(), base_color.blue(), 160
                 )
                 pen = QPen(border_color)
                 pen.setWidth(2)
@@ -394,6 +408,9 @@ class PDFPageLabel(QLabel):
 
             painter.drawRect(qrect)
         painter.end()
+
+        self._hl_cache = canvas
+        self._hl_cache_key = cache_key
         self.setPixmap(canvas)
 
     def mouseMoveEvent(self, event: QMouseEvent):
@@ -566,6 +583,7 @@ class PDFPageLabel(QLabel):
 
     def ignore_match(self, match):
         match["ignored"] = True
+        self._hl_cache_key = None  # List mutated in-place — force a full repaint
         self.draw_highlights()
         self.matchIgnored.emit(match)
 
@@ -629,6 +647,10 @@ class MiniMapWidget(QWidget):
             y_offsets.append(curr_offset)
             curr_offset += ph
 
+        # Matches with more words (longer text overlaps) get brighter, thicker lines.
+        # 30+ words = full intensity; 2-3 words = faint & thin.
+        _MAX_REF_WORDS = 30
+
         painter = QPainter(self._lines_cache)
         for page_idx, matches in self.matches.items():
             if page_idx >= len(y_offsets):
@@ -639,10 +661,17 @@ class MiniMapWidget(QWidget):
                     continue
                 r = m["rect"]
                 y_pixel = int(((page_base_y + r.y0) / total_doc_height) * h)
+
+                # Weight by word count: small matches fade into the background
+                word_count = len(m.get("source_data", []))
+                weight = min(1.0, word_count / _MAX_REF_WORDS)
+                alpha = int(40 + weight * 210)  # 40 (tiny) → 250 (large)
+                line_width = max(1, round(1 + weight * 2))  # 1 px → 3 px
+
                 color = QColor(self.color_map.get(m["source"], QColor(255, 0, 0)))
-                color.setAlpha(220)
+                color.setAlpha(alpha)
                 pen = QPen(color)
-                pen.setWidth(2)
+                pen.setWidth(line_width)
                 painter.setPen(pen)
                 painter.drawLine(2, y_pixel, w - 2, y_pixel)
         painter.end()
