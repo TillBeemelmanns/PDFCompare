@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QColor, QPalette, QPixmap
 from PyQt6.QtCore import Qt, QThread, QTimer, QThreadPool
 
-from compare_logic import PDFComparator
+from compare_logic import PDFComparator, _INDEX_CACHE_DIR
 from gui.widgets import FileListWidget, PDFPageLabel, MiniMapWidget
 from gui.workers import CompareWorker, IndexWorker, PageRenderWorker
 from gui.pdf_renderer import PDFRenderer
@@ -166,6 +166,7 @@ class MainWindow(QMainWindow):
         self._bg_render_pool = QThreadPool()
         self._bg_render_pool.setMaxThreadCount(2)
         self._pending_bg_render_worker = None
+        self._pending_bg_source_worker = None
 
         self.init_ui()
 
@@ -482,6 +483,15 @@ class MainWindow(QMainWindow):
         self.btn_clear.setToolTip("Remove comparison results and reset both viewers.")
         self.btn_clear.clicked.connect(self.clear_results)
         left_layout.addWidget(self.btn_clear)
+
+        # Clear Index Cache button
+        btn_clear_cache = QPushButton("🗑  Clear Index Cache")
+        btn_clear_cache.setToolTip(
+            "Delete all cached reference index files from ~/.pdfcompare/index_cache/.\n"
+            "Forces a full re-parse of reference PDFs on the next run."
+        )
+        btn_clear_cache.clicked.connect(self.clear_index_cache)
+        left_layout.addWidget(btn_clear_cache)
 
         left_layout.addSpacing(10)
 
@@ -1089,7 +1099,12 @@ class MainWindow(QMainWindow):
         self._source_scroll_timer.start()
 
     def _update_visible_source_pages(self) -> None:
-        """Materialize source pages near the viewport; clear pixmaps of distant ones."""
+        """Materialize source pages near the viewport; clear pixmaps of distant ones.
+
+        Cached pages are materialized immediately on the main thread.
+        Uncached pages are rendered off-thread by PageRenderWorker so the UI
+        never blocks waiting for fitz rasterisation.
+        """
         if not self._source_page_slots:
             return
 
@@ -1099,13 +1114,46 @@ class MainWindow(QMainWindow):
         render_top = max(0, scroll_value - viewport_height)
         render_bottom = scroll_value + 2 * viewport_height
 
+        pages_in_zone: list[int] = []
+        pages_out_of_zone: list[int] = []
+
         for slot_idx, (y_off, (_w, h)) in enumerate(
             zip(self._source_page_y_offsets, self._source_page_dims)
         ):
             if y_off + h >= render_top and y_off <= render_bottom:
-                self._materialize_source_page(slot_idx)
+                pages_in_zone.append(slot_idx)
             else:
-                self._dematerialize_source_page(slot_idx)
+                pages_out_of_zone.append(slot_idx)
+
+        # Split in-zone pages into already-cached (instant) vs uncached (background)
+        zoom_key = round(self.zoom_level, 2)
+        cached_in_zone = [
+            i
+            for i in pages_in_zone
+            if self.source_renderer.pixmap_cache.get(
+                (self._source_virtual_file, i, zoom_key)
+            )
+            is not None
+        ]
+        uncached_in_zone = [i for i in pages_in_zone if i not in set(cached_in_zone)]
+
+        # Materialize cached pages right now — zero blocking work
+        for i in cached_in_zone:
+            self._materialize_source_page(i)
+
+        # Render uncached pages in a background thread
+        if uncached_in_zone:
+            if self._pending_bg_source_worker is not None:
+                self._pending_bg_source_worker.cancel()
+            worker = PageRenderWorker(
+                self._source_virtual_file, uncached_in_zone, self.zoom_level
+            )
+            worker.signals.finished.connect(self._on_bg_source_pages_rendered)
+            self._pending_bg_source_worker = worker
+            self._bg_render_pool.start(worker)
+
+        for i in pages_out_of_zone:
+            self._dematerialize_source_page(i)
 
     def _materialize_source_page(self, slot_idx: int) -> None:
         """Set the rendered pixmap on the source page's label (no layout change)."""
@@ -1131,12 +1179,43 @@ class MainWindow(QMainWindow):
         lbl._hl_cache_key = None
         self._source_page_slot_data[slot_idx]["materialized"] = False
 
+    def _on_bg_source_pages_rendered(self, results: list, zoom: float) -> None:
+        """Main-thread callback: convert QImages → QPixmaps, store, materialise."""
+        self._pending_bg_source_worker = None
+
+        # Discard if the view has since been rebuilt at a different zoom / file
+        if not self._source_page_slots or zoom != round(self.zoom_level, 2):
+            return
+
+        for page_idx, qimg in results:
+            pixmap = QPixmap.fromImage(qimg)
+            self.source_renderer.store_pixmap(
+                self._source_virtual_file, page_idx, zoom, pixmap
+            )
+
+        # Materialise only pages still inside the visible buffer zone
+        viewport_height = self.source_scroll.viewport().height()
+        scroll_value = self.source_scroll.verticalScrollBar().value()
+        render_top = max(0, scroll_value - viewport_height)
+        render_bottom = scroll_value + 2 * viewport_height
+
+        for page_idx, _ in results:
+            if page_idx >= len(self._source_page_slot_data):
+                continue
+            y_off = self._source_page_y_offsets[page_idx]
+            _w, h = self._source_page_dims[page_idx]
+            if y_off + h >= render_top and y_off <= render_bottom:
+                self._materialize_source_page(page_idx)
+
     def clear_results(self):
         """Reset both viewers and all comparison state without clearing file lists."""
         # Stop any in-flight work
         if self._pending_bg_render_worker is not None:
             self._pending_bg_render_worker.cancel()
             self._pending_bg_render_worker = None
+        if self._pending_bg_source_worker is not None:
+            self._pending_bg_source_worker.cancel()
+            self._pending_bg_source_worker = None
         self._refresh_timer.stop()
 
         # Reset state
@@ -1191,6 +1270,18 @@ class MainWindow(QMainWindow):
         self.lbl_stats_matches.setText("Matches: —")
         self.update_stats()
         self.status_bar.showMessage("Results cleared.", 3000)
+
+    def clear_index_cache(self):
+        """Delete all .pkl files from the on-disk reference index cache."""
+        if not _INDEX_CACHE_DIR.exists():
+            self.status_bar.showMessage("Index cache is already empty.", 3000)
+            return
+        files = list(_INDEX_CACHE_DIR.glob("*.pkl"))
+        for f in files:
+            f.unlink()
+        self.status_bar.showMessage(
+            f"Index cache cleared — {len(files)} file(s) removed.", 4000
+        )
 
     def handle_match_ignored(self, match):
         mid = match.get("match_id")
@@ -1305,6 +1396,10 @@ class MainWindow(QMainWindow):
         )
 
         if should_rerender:
+            if self._pending_bg_source_worker is not None:
+                self._pending_bg_source_worker.cancel()
+                self._pending_bg_source_worker = None
+
             self.last_rendered_source = file_path
             self.last_rendered_zoom = self.zoom_level
 

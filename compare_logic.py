@@ -7,8 +7,12 @@ This module provides the core comparison algorithms:
 """
 
 import fitz  # PyMuPDF
+import hashlib
+import os
+import pickle
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Optional, Callable
 import numpy as np
 
@@ -210,6 +214,9 @@ STOPWORDS = frozenset(
 )
 
 
+_INDEX_CACHE_DIR = Path.home() / ".pdfcompare" / "index_cache"
+
+
 class PDFComparator:
     """
     High-performance PDF document comparator.
@@ -229,6 +236,34 @@ class PDFComparator:
 
         # Pre-compute hash function for performance
         self._hash = hash
+
+    @staticmethod
+    def _cache_key(file_path: str) -> str:
+        stat = os.stat(file_path)
+        raw = f"{file_path}\x00{stat.st_mtime}\x00{stat.st_size}"
+        return hashlib.md5(raw.encode()).hexdigest()
+
+    @staticmethod
+    def _load_index_cache(file_path: str) -> list | None:
+        key = PDFComparator._cache_key(file_path)
+        cache_path = _INDEX_CACHE_DIR / f"{key}.pkl"
+        if cache_path.exists():
+            try:
+                with cache_path.open("rb") as f:
+                    return pickle.load(f)
+            except Exception:
+                cache_path.unlink(missing_ok=True)
+        return None
+
+    @staticmethod
+    def _save_index_cache(file_path: str, filtered_raw: list) -> None:
+        _INDEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        key = PDFComparator._cache_key(file_path)
+        try:
+            with (_INDEX_CACHE_DIR / f"{key}.pkl").open("wb") as f:
+                pickle.dump(filtered_raw, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:
+            pass  # non-critical
 
     def _normalize(self, text: str) -> str:
         """Normalize text to lowercase alphanumeric characters."""
@@ -285,25 +320,42 @@ class PDFComparator:
         Process a single reference file (for parallel execution).
 
         Returns:
-            Tuple of (file_path, filtered_words, gram_index_entries, word_index_entries)
+            Tuple of (file_path, ref_map, gram_index_entries, word_index_entries)
         """
-        doc = fitz.open(file_path)
-        merged = self._extract_and_dehyphenate(doc)
-        doc.close()
+        filtered_raw = self._load_index_cache(file_path)
 
-        filtered = list(self._filter_words_merged(merged))
-        ref_map = [(x[2], x[1]) for x in filtered]
+        if filtered_raw is None:
+            # Slow path: parse PDF with fitz
+            doc = fitz.open(file_path)
+            merged = self._extract_and_dehyphenate(doc)
+            doc.close()
+            filtered = list(self._filter_words_merged(merged))
+            # Serialize fitz.Rect → tuple for pickle portability
+            filtered_raw = [
+                (i, norm, [(p, (r.x0, r.y0, r.x1, r.y1), w) for p, r, w in parts])
+                for i, norm, parts in filtered
+            ]
+            self._save_index_cache(file_path, filtered_raw)
 
-        # Collect gram indices
-        gram_entries = []
-        for idx, gram in self._generate_grams(filtered, self.seed_size):
-            gram_entries.append((self._hash(gram), file_path, idx))
+        # Reconstruct with fitz.Rect objects (fast, no I/O)
+        filtered = [
+            (
+                i,
+                norm,
+                [
+                    (p, fitz.Rect(rx0, ry0, rx1, ry1), w)
+                    for p, (rx0, ry0, rx1, ry1), w in parts_raw
+                ],
+            )
+            for i, norm, parts_raw in filtered_raw
+        ]
 
-        # Collect word indices
-        word_entries = []
-        for idx, norm_word, _ in filtered:
-            word_entries.append((norm_word, file_path, idx))
-
+        ref_map = [(parts, norm) for (_, norm, parts) in filtered]
+        gram_entries = [
+            (self._hash(gram), file_path, idx)
+            for idx, gram in self._generate_grams(filtered, self.seed_size)
+        ]
+        word_entries = [(norm_word, file_path, idx) for idx, norm_word, _ in filtered]
         return file_path, ref_map, gram_entries, word_entries
 
     def add_references(
