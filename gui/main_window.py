@@ -31,12 +31,12 @@ from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
 )
-from PyQt6.QtGui import QColor, QPalette
-from PyQt6.QtCore import Qt, QThread, QTimer
+from PyQt6.QtGui import QColor, QPalette, QPixmap
+from PyQt6.QtCore import Qt, QThread, QTimer, QThreadPool
 
-from compare_logic import PDFComparator
+from compare_logic import PDFComparator, _INDEX_CACHE_DIR
 from gui.widgets import FileListWidget, PDFPageLabel, MiniMapWidget
-from gui.workers import CompareWorker, IndexWorker
+from gui.workers import CompareWorker, IndexWorker, PageRenderWorker
 from gui.pdf_renderer import PDFRenderer
 
 
@@ -112,8 +112,8 @@ class MainWindow(QMainWindow):
 
         # Core components
         self.comparator = PDFComparator()
-        self.target_renderer = PDFRenderer(cache_size=100)
-        self.source_renderer = PDFRenderer(cache_size=50)
+        self.target_renderer = PDFRenderer(max_bytes=256 * 1024 * 1024)  # 256 MB
+        self.source_renderer = PDFRenderer(max_bytes=128 * 1024 * 1024)  # 128 MB
         self.process = psutil.Process(os.getpid())
 
         # Color mapping for sources
@@ -129,6 +129,44 @@ class MainWindow(QMainWindow):
         self.ignored_match_ids = set()
         self.current_match_list = []
         self.current_match_index = 0
+        self.widget_pool = []  # Pool for PDFPageLabel reuse
+
+        # Virtual scroll state — target view
+        self._page_slots: list = []
+        self._page_slot_data: list = []
+        self._target_page_dims: list = []
+        self._target_page_y_offsets: list = []
+        self._target_virtual_file: str = None
+
+        # Virtual scroll state — source view
+        self._source_page_slots: list = []
+        self._source_page_slot_data: list = []
+        self._source_page_dims: list = []
+        self._source_page_y_offsets: list = []
+        self._source_virtual_file: str = None
+
+        # Debounce timer — fires _do_refresh_target_view 150 ms after last call
+        self._refresh_timer = QTimer()
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(150)
+        self._refresh_timer.timeout.connect(self._do_refresh_target_view)
+
+        # Throttle timers — limit virtual scroll updates to ~20 fps
+        self._virtual_scroll_timer = QTimer()
+        self._virtual_scroll_timer.setSingleShot(True)
+        self._virtual_scroll_timer.setInterval(50)
+        self._virtual_scroll_timer.timeout.connect(self._update_visible_target_pages)
+
+        self._source_scroll_timer = QTimer()
+        self._source_scroll_timer.setSingleShot(True)
+        self._source_scroll_timer.setInterval(50)
+        self._source_scroll_timer.timeout.connect(self._update_visible_source_pages)
+
+        # Background page-render pool (uncached pages while scrolling)
+        self._bg_render_pool = QThreadPool()
+        self._bg_render_pool.setMaxThreadCount(2)
+        self._pending_bg_render_worker = None
+        self._pending_bg_source_worker = None
 
         self.init_ui()
 
@@ -172,9 +210,6 @@ class MainWindow(QMainWindow):
 
         # Global stylesheet for additional styling
         QApplication.instance().setStyleSheet(f"""
-            QMainWindow {{
-                background-color: {Theme.BASE};
-            }}
             QGroupBox {{
                 font-weight: bold;
                 border: 1px solid {Theme.SURFACE1};
@@ -295,15 +330,22 @@ class MainWindow(QMainWindow):
         """)
 
     def init_ui(self):
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        main_layout = QHBoxLayout(main_widget)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(12)
+        # Create the splitter as the primary layout element
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.setCentralWidget(splitter)
+
+        # Left Panel with Scroll Area
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setMinimumWidth(280)
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(12, 12, 12, 12)
         left_layout.setSpacing(8)
+        left_scroll.setWidget(left_panel)
 
         # Algorithm Parameters Group
         gb_config = QGroupBox("Algorithm Parameters")
@@ -319,6 +361,10 @@ class MainWindow(QMainWindow):
         self.spin_seed = QSpinBox()
         self.spin_seed.setRange(2, 10)
         self.spin_seed.setValue(3)
+        self.spin_seed.setToolTip(
+            "Minimum number of consecutive words that must match to form a\n"
+            "candidate block. Higher = fewer but more reliable matches."
+        )
         hbox_seed.addWidget(self.spin_seed)
         gb_layout.addLayout(hbox_seed)
 
@@ -327,6 +373,10 @@ class MainWindow(QMainWindow):
         self.spin_merge = QSpinBox()
         self.spin_merge.setRange(0, 100)
         self.spin_merge.setValue(15)
+        self.spin_merge.setToolTip(
+            "Maximum word gap between two adjacent matches that will be\n"
+            "merged into a single block. Higher = fewer, larger blocks."
+        )
         hbox_merge.addWidget(self.spin_merge)
         gb_layout.addLayout(hbox_merge)
 
@@ -334,6 +384,10 @@ class MainWindow(QMainWindow):
         hbox_mode.addWidget(QLabel("Compare Mode:"))
         self.combo_mode = QComboBox()
         self.combo_mode.addItems(["Fast (Exact N-Gram)", "Fuzzy (Levenshtein)"])
+        self.combo_mode.setToolTip(
+            "Fast: exact n-gram matching — best for identical or near-identical text.\n"
+            "Fuzzy: Levenshtein distance allows minor typos and OCR errors (slower)."
+        )
         hbox_mode.addWidget(self.combo_mode)
         gb_layout.addLayout(hbox_mode)
 
@@ -344,6 +398,11 @@ class MainWindow(QMainWindow):
 
         self.chk_sw_refinement = QCheckBox("Enable Smith-Waterman Refinement")
         self.chk_sw_refinement.setChecked(True)
+        self.chk_sw_refinement.setToolTip(
+            "Refines n-gram candidates with Smith-Waterman local alignment.\n"
+            "Produces precise match boundaries and a confidence score (0–1).\n"
+            "Disable for a faster but coarser result."
+        )
         gb_layout.addWidget(self.chk_sw_refinement)
 
         hbox_expansion = QHBoxLayout()
@@ -351,6 +410,11 @@ class MainWindow(QMainWindow):
         self.spin_expansion = QSpinBox()
         self.spin_expansion.setRange(0, 50)
         self.spin_expansion.setValue(1)
+        self.spin_expansion.setToolTip(
+            "Extra words inspected beyond each n-gram match boundary when\n"
+            "running Smith-Waterman. Helps capture leading/trailing context\n"
+            "that the n-gram phase may have clipped."
+        )
         hbox_expansion.addWidget(self.spin_expansion)
         gb_layout.addLayout(hbox_expansion)
 
@@ -360,6 +424,7 @@ class MainWindow(QMainWindow):
         # Reference Files
         left_layout.addWidget(QLabel("Reference PDFs:"))
         self.reference_list = FileListWidget("References")
+        self.reference_list.setMinimumHeight(120)
         left_layout.addWidget(self.reference_list)
 
         btn_clr_ref = QPushButton("Clear References")
@@ -371,7 +436,7 @@ class MainWindow(QMainWindow):
         # Target File
         left_layout.addWidget(QLabel("Target PDF:"))
         self.target_list = FileListWidget("Target")
-        self.target_list.setMaximumHeight(80)
+        self.target_list.setFixedHeight(80)
         left_layout.addWidget(self.target_list)
 
         btn_clr_tgt = QPushButton("Clear Target")
@@ -412,6 +477,22 @@ class MainWindow(QMainWindow):
         self.progress_bar.setTextVisible(True)
         left_layout.addWidget(self.progress_bar)
 
+        # Clear Results button
+        self.btn_clear = QPushButton("✕  Clear Results")
+        self.btn_clear.setEnabled(False)
+        self.btn_clear.setToolTip("Remove comparison results and reset both viewers.")
+        self.btn_clear.clicked.connect(self.clear_results)
+        left_layout.addWidget(self.btn_clear)
+
+        # Clear Index Cache button
+        btn_clear_cache = QPushButton("🗑  Clear Index Cache")
+        btn_clear_cache.setToolTip(
+            "Delete all cached reference index files from ~/.pdfcompare/index_cache/.\n"
+            "Forces a full re-parse of reference PDFs on the next run."
+        )
+        btn_clear_cache.clicked.connect(self.clear_index_cache)
+        left_layout.addWidget(btn_clear_cache)
+
         left_layout.addSpacing(10)
 
         # Legend
@@ -426,12 +507,14 @@ class MainWindow(QMainWindow):
         self.lbl_stats_ngrams = QLabel("N-Grams: 0")
         self.lbl_stats_mem = QLabel("Memory: 0 MB")
         self.lbl_stats_cache = QLabel("Cache: 0 pages")
+        self.lbl_stats_matches = QLabel("Matches: —")
         self.lbl_stats_mem.setToolTip(
             "Total Resident Set Size (RSS) of the application process."
         )
         self.stats_layout.addWidget(self.lbl_stats_ngrams)
         self.stats_layout.addWidget(self.lbl_stats_mem)
         self.stats_layout.addWidget(self.lbl_stats_cache)
+        self.stats_layout.addWidget(self.lbl_stats_matches)
         gb_stats.setLayout(self.stats_layout)
         left_layout.addWidget(gb_stats)
 
@@ -453,9 +536,10 @@ class MainWindow(QMainWindow):
         # Middle Panel (Reference Viewer)
         middle_wrapper = QWidget()
         middle_layout = QVBoxLayout(middle_wrapper)
-        middle_layout.setContentsMargins(0, 0, 0, 0)
+        middle_layout.setContentsMargins(0, 12, 0, 12)
 
         h_header = QHBoxLayout()
+        h_header.setContentsMargins(12, 0, 12, 0)
         self.lbl_source_title = QLabel("<b>Matched Reference Viewer</b>")
         h_header.addWidget(self.lbl_source_title)
 
@@ -503,6 +587,9 @@ class MainWindow(QMainWindow):
         self.source_container = QWidget()
         self.source_layout = QVBoxLayout(self.source_container)
         self.source_scroll.setWidget(self.source_container)
+        self.source_scroll.verticalScrollBar().valueChanged.connect(
+            self._on_source_scroll
+        )
         self.source_stack.addWidget(self.source_scroll)
 
         self.source_text_edit = QTextEdit()
@@ -521,17 +608,19 @@ class MainWindow(QMainWindow):
         # Right Panel (Target Viewer)
         right_wrapper = QWidget()
         right_main_layout = QVBoxLayout(right_wrapper)
-        right_main_layout.setContentsMargins(0, 0, 0, 0)
+        right_main_layout.setContentsMargins(0, 12, 12, 12)
 
         h_right_head = QHBoxLayout()
+        h_right_head.setContentsMargins(0, 0, 0, 0)
         h_right_head.addWidget(
             QLabel("<b>Target Document</b> (Click highlights to trace)")
         )
 
-        self.chk_hover = QCheckBox("Preview")
-        self.chk_hover.setChecked(True)
-        self.chk_hover.stateChanged.connect(self.toggle_hover_previews)
-        h_right_head.addWidget(self.chk_hover)
+        self.chk_minimap = QCheckBox("Map")
+        self.chk_minimap.setChecked(True)
+        self.chk_minimap.stateChanged.connect(self._toggle_minimap)
+        h_right_head.addWidget(self.chk_minimap)
+
         h_right_head.addStretch()
 
         btn_zoom_in_t = QPushButton("+")
@@ -560,18 +649,16 @@ class MainWindow(QMainWindow):
         right_main_layout.addLayout(right_content_hbox)
 
         self.target_scroll.verticalScrollBar().valueChanged.connect(
-            self.update_mini_map_viewport
+            self._on_target_scroll
         )
 
-        # Splitter setup
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(left_panel)
+        # Add panels to splitter
+        splitter.addWidget(left_scroll)
         splitter.addWidget(middle_wrapper)
         splitter.addWidget(right_wrapper)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
         splitter.setStretchFactor(2, 2)
-        main_layout.addWidget(splitter)
 
     def change_zoom(self, delta):
         self.zoom_level = max(0.5, min(3.0, self.zoom_level + delta))
@@ -584,18 +671,19 @@ class MainWindow(QMainWindow):
         bar.setValue(int(percent * bar.maximum()))
 
     def update_mini_map_viewport(self):
+        if not self.mini_map.isVisible():
+            return
         bar = self.target_scroll.verticalScrollBar()
         if bar.maximum() > 0:
             self.mini_map.set_viewport(
                 bar.value() / bar.maximum(), bar.pageStep() / bar.maximum()
             )
 
-    def toggle_hover_previews(self):
-        state = self.chk_hover.isChecked()
-        for i in range(self.target_layout.count()):
-            w = self.target_layout.itemAt(i).widget()
-            if isinstance(w, PDFPageLabel):
-                w.show_hover_previews = state
+    def _toggle_minimap(self, state: int) -> None:
+        visible = bool(state)
+        self.mini_map.setVisible(visible)
+        if visible:
+            self.update_mini_map_viewport()
 
     def toggle_source_view(self):
         self.source_stack.setCurrentIndex(1 if self.btn_toggle_view.isChecked() else 0)
@@ -606,6 +694,10 @@ class MainWindow(QMainWindow):
         )
 
     def refresh_target_view(self):
+        """Debounced entry point — coalesces rapid calls (legend toggles, zoom) into one."""
+        self._refresh_timer.start()
+
+    def _do_refresh_target_view(self):
         if not self.current_results:
             return
 
@@ -747,11 +839,22 @@ class MainWindow(QMainWindow):
             """)
             self.legend_layout.addWidget(chk)
 
+        self.btn_clear.setEnabled(True)
+
+        n_matches = sum(len(m) for m in results.values())
+        overlap_pct = (
+            (sum(source_stats.values()) / total_words * 100) if total_words > 0 else 0.0
+        )
+        self.lbl_stats_matches.setText(
+            f"Matches: {n_matches} blocks / {overlap_pct:.1f}% overlap"
+        )
+
         self.refresh_target_view()
         self.update_stats()
         self.status_bar.showMessage(
-            f"Comparison complete. Found matches from {len(source_stats)} sources.",
-            5000,
+            f"Done. {n_matches} match blocks from {len(source_stats)} source(s)"
+            f" — {overlap_pct:.1f}% overlap.",
+            8000,
         )
 
     def update_stats(self):
@@ -764,28 +867,62 @@ class MainWindow(QMainWindow):
         cache_stats = self.target_renderer.get_cache_stats()
         source_cache_stats = self.source_renderer.get_cache_stats()
         total_cached = cache_stats["cached_pages"] + source_cache_stats["cached_pages"]
-        self.lbl_stats_cache.setText(f"Cached Pages: {total_cached}")
+        total_mb = (
+            (cache_stats["used_bytes"] + source_cache_stats["used_bytes"]) / 1024 / 1024
+        )
+        self.lbl_stats_cache.setText(f"Cache: {total_cached} pages / {total_mb:.0f} MB")
 
     def render_target(self, file_path, results):
         """
-        Render target document with cached pixmaps.
+        Render target document using pixmap-swap lazy loading.
+
+        All PDFPageLabel widgets stay in the layout permanently (stable layout,
+        zero reflows during scroll). Materialization = set pixmap + draw highlights.
+        Dematerialization = clear pixmap, releasing GPU/RAM for off-screen pages.
         """
-        # Clear existing widgets properly
+        # Cancel any in-flight background render so stale results don't arrive
+        if self._pending_bg_render_worker is not None:
+            self._pending_bg_render_worker.cancel()
+            self._pending_bg_render_worker = None
+
+        # Drain existing layout: pool all PDFPageLabel, discard spacers
         while self.target_layout.count():
             item = self.target_layout.takeAt(0)
             widget = item.widget()
-            if widget:
+            if widget is not None:
                 widget.setParent(None)
-                widget.deleteLater()
+                widget.hide()
+                self.widget_pool.append(widget)
 
-        doc = fitz.open(file_path)
+        self._page_slots = []
+        self._page_slot_data = []
+        self._target_virtual_file = file_path
+
         zoom = self.zoom_level
 
-        for page_idx, page in enumerate(doc):
-            # Use cached pixmap
-            pixmap = self.target_renderer.get_cached_pixmap(file_path, page_idx, zoom)
+        # One fitz open to get page dimensions (for fixed sizes)
+        self._target_page_dims = self.target_renderer.get_page_dimensions(
+            file_path, zoom
+        )
+        n_pages = len(self._target_page_dims)
 
-            # Build highlights for this page
+        # Cumulative y-offsets for O(1) in-zone range checks during scroll
+        self._target_page_y_offsets = []
+        y = 0
+        for _w, h in self._target_page_dims:
+            self._target_page_y_offsets.append(y)
+            y += h + 10  # matches addSpacing(10)
+
+        # Pre-render first ~2 viewport heights in one fitz open
+        vh = max(self.target_scroll.viewport().height(), 600)
+        prerender_pages = [
+            i for i, y_off in enumerate(self._target_page_y_offsets) if y_off < vh * 2
+        ]
+        self.target_renderer.batch_prerender(file_path, prerender_pages, zoom)
+
+        # Create all page widgets and add them to the layout once.
+        # Widgets stay in the layout forever; only their pixmaps are swapped.
+        for page_idx in range(n_pages):
             highlights = []
             if page_idx in results:
                 for m in results[page_idx]:
@@ -803,15 +940,348 @@ class MainWindow(QMainWindow):
                         }
                     )
 
-            lbl = PDFPageLabel(pixmap, highlights, self.color_map)
+            w_px, h_px = self._target_page_dims[page_idx]
+            if self.widget_pool:
+                lbl = self.widget_pool.pop()
+                try:
+                    lbl.matchesClicked.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+                try:
+                    lbl.matchIgnored.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+                lbl.original_pixmap = QPixmap()
+                lbl.highlights = highlights
+                lbl.color_map = self.color_map
+                lbl.setPixmap(QPixmap())
+            else:
+                lbl = PDFPageLabel(QPixmap(), highlights, self.color_map)
+
             lbl.page_index = page_idx
-            lbl.show_hover_previews = self.chk_hover.isChecked()
             lbl.matchesClicked.connect(self.handle_matches_clicked)
             lbl.matchIgnored.connect(self.handle_match_ignored)
+            # Fixed size keeps layout stable when pixmap is cleared
+            lbl.setFixedSize(int(w_px), int(h_px))
+            lbl.show()
+
             self.target_layout.addWidget(lbl)
             self.target_layout.addSpacing(10)
 
-        doc.close()
+            self._page_slots.append(lbl)
+            self._page_slot_data.append(
+                {"highlights": highlights, "materialized": False}
+            )
+
+        # Let Qt finish the layout pass, then materialize the visible pages
+        QTimer.singleShot(0, self._update_visible_target_pages)
+
+    def _on_target_scroll(self, value: int) -> None:
+        """Called on every scroll-bar value change in the target view."""
+        if self.mini_map.isVisible():
+            self.update_mini_map_viewport()
+        # Throttle: update visible pages at most once per 50 ms
+        self._virtual_scroll_timer.start()
+
+    def _update_visible_target_pages(self) -> None:
+        """Materialize pages near the viewport; clear pixmaps of distant ones.
+
+        Cached pages are materialized immediately on the main thread.
+        Uncached pages are rendered off-thread by PageRenderWorker so the UI
+        never blocks waiting for fitz rasterisation.
+        """
+        if not self._page_slots:
+            return
+
+        viewport_height = self.target_scroll.viewport().height()
+        scroll_value = self.target_scroll.verticalScrollBar().value()
+
+        render_top = max(0, scroll_value - viewport_height)
+        render_bottom = scroll_value + 2 * viewport_height
+
+        pages_in_zone: list[int] = []
+        pages_out_of_zone: list[int] = []
+
+        for i, (y_off, (_w, h)) in enumerate(
+            zip(self._target_page_y_offsets, self._target_page_dims)
+        ):
+            if y_off + h >= render_top and y_off <= render_bottom:
+                pages_in_zone.append(i)
+            else:
+                pages_out_of_zone.append(i)
+
+        # Split in-zone pages into already-cached (instant) vs uncached (background)
+        zoom_key = round(self.zoom_level, 2)
+        cached_in_zone = [
+            i
+            for i in pages_in_zone
+            if self.target_renderer.pixmap_cache.get(
+                (self._target_virtual_file, i, zoom_key)
+            )
+            is not None
+        ]
+        uncached_in_zone = [i for i in pages_in_zone if i not in set(cached_in_zone)]
+
+        # Materialize cached pages right now — zero blocking work
+        for i in cached_in_zone:
+            self._materialize_target_page(i)
+
+        # Render uncached pages in a background thread
+        if uncached_in_zone:
+            if self._pending_bg_render_worker is not None:
+                self._pending_bg_render_worker.cancel()
+            worker = PageRenderWorker(
+                self._target_virtual_file, uncached_in_zone, self.zoom_level
+            )
+            worker.signals.finished.connect(self._on_bg_pages_rendered)
+            self._pending_bg_render_worker = worker
+            self._bg_render_pool.start(worker)
+
+        for i in pages_out_of_zone:
+            self._dematerialize_target_page(i)
+
+    def _on_bg_pages_rendered(self, results: list, zoom: float) -> None:
+        """Main-thread callback: convert QImages → QPixmaps, store, materialise."""
+        self._pending_bg_render_worker = None
+
+        # Discard if the view has since been rebuilt at a different zoom / file
+        if not self._page_slots or zoom != round(self.zoom_level, 2):
+            return
+
+        for page_idx, qimg in results:
+            pixmap = QPixmap.fromImage(qimg)
+            self.target_renderer.store_pixmap(
+                self._target_virtual_file, page_idx, zoom, pixmap
+            )
+
+        # Materialise only pages still inside the visible buffer zone
+        viewport_height = self.target_scroll.viewport().height()
+        scroll_value = self.target_scroll.verticalScrollBar().value()
+        render_top = max(0, scroll_value - viewport_height)
+        render_bottom = scroll_value + 2 * viewport_height
+
+        for page_idx, _ in results:
+            if page_idx >= len(self._page_slot_data):
+                continue
+            y_off = self._target_page_y_offsets[page_idx]
+            _w, h = self._target_page_dims[page_idx]
+            if y_off + h >= render_top and y_off <= render_bottom:
+                self._materialize_target_page(page_idx)
+
+    def _materialize_target_page(self, page_idx: int) -> None:
+        """Set the rendered pixmap on the page's PDFPageLabel (no layout change)."""
+        if self._page_slot_data[page_idx]["materialized"]:
+            return
+        lbl = self._page_slots[page_idx]
+        pixmap = self.target_renderer.get_cached_pixmap(
+            self._target_virtual_file, page_idx, self.zoom_level
+        )
+        lbl.original_pixmap = pixmap
+        # Correct fixed size to match exact rendered dimensions (rounding may differ)
+        lbl.setFixedSize(pixmap.width(), pixmap.height())
+        lbl.draw_highlights()
+        self._page_slot_data[page_idx]["materialized"] = True
+
+    def _dematerialize_target_page(self, page_idx: int) -> None:
+        """Clear the pixmap from the page's PDFPageLabel to free RAM (no layout change)."""
+        if not self._page_slot_data[page_idx]["materialized"]:
+            return
+        lbl = self._page_slots[page_idx]
+        lbl.original_pixmap = QPixmap()
+        lbl.setPixmap(QPixmap())
+        lbl._hl_cache = None  # Free the highlighted-pixmap copy too
+        lbl._hl_cache_key = None
+        # setFixedSize remains intact — layout is unchanged
+        self._page_slot_data[page_idx]["materialized"] = False
+
+    def _on_source_scroll(self, value: int) -> None:
+        """Called on every scroll-bar value change in the source view."""
+        self._source_scroll_timer.start()
+
+    def _update_visible_source_pages(self) -> None:
+        """Materialize source pages near the viewport; clear pixmaps of distant ones.
+
+        Cached pages are materialized immediately on the main thread.
+        Uncached pages are rendered off-thread by PageRenderWorker so the UI
+        never blocks waiting for fitz rasterisation.
+        """
+        if not self._source_page_slots:
+            return
+
+        viewport_height = self.source_scroll.viewport().height()
+        scroll_value = self.source_scroll.verticalScrollBar().value()
+
+        render_top = max(0, scroll_value - viewport_height)
+        render_bottom = scroll_value + 2 * viewport_height
+
+        pages_in_zone: list[int] = []
+        pages_out_of_zone: list[int] = []
+
+        for slot_idx, (y_off, (_w, h)) in enumerate(
+            zip(self._source_page_y_offsets, self._source_page_dims)
+        ):
+            if y_off + h >= render_top and y_off <= render_bottom:
+                pages_in_zone.append(slot_idx)
+            else:
+                pages_out_of_zone.append(slot_idx)
+
+        # Split in-zone pages into already-cached (instant) vs uncached (background)
+        zoom_key = round(self.zoom_level, 2)
+        cached_in_zone = [
+            i
+            for i in pages_in_zone
+            if self.source_renderer.pixmap_cache.get(
+                (self._source_virtual_file, i, zoom_key)
+            )
+            is not None
+        ]
+        uncached_in_zone = [i for i in pages_in_zone if i not in set(cached_in_zone)]
+
+        # Materialize cached pages right now — zero blocking work
+        for i in cached_in_zone:
+            self._materialize_source_page(i)
+
+        # Render uncached pages in a background thread
+        if uncached_in_zone:
+            if self._pending_bg_source_worker is not None:
+                self._pending_bg_source_worker.cancel()
+            worker = PageRenderWorker(
+                self._source_virtual_file, uncached_in_zone, self.zoom_level
+            )
+            worker.signals.finished.connect(self._on_bg_source_pages_rendered)
+            self._pending_bg_source_worker = worker
+            self._bg_render_pool.start(worker)
+
+        for i in pages_out_of_zone:
+            self._dematerialize_source_page(i)
+
+    def _materialize_source_page(self, slot_idx: int) -> None:
+        """Set the rendered pixmap on the source page's label (no layout change)."""
+        if self._source_page_slot_data[slot_idx]["materialized"]:
+            return
+        lbl = self._source_page_slots[slot_idx]
+        pixmap = self.source_renderer.get_cached_pixmap(
+            self._source_virtual_file, slot_idx, self.zoom_level
+        )
+        lbl.original_pixmap = pixmap
+        lbl.setFixedSize(pixmap.width(), pixmap.height())
+        lbl.draw_highlights()
+        self._source_page_slot_data[slot_idx]["materialized"] = True
+
+    def _dematerialize_source_page(self, slot_idx: int) -> None:
+        """Clear the pixmap from the source page's label to free RAM (no layout change)."""
+        if not self._source_page_slot_data[slot_idx]["materialized"]:
+            return
+        lbl = self._source_page_slots[slot_idx]
+        lbl.original_pixmap = QPixmap()
+        lbl.setPixmap(QPixmap())
+        lbl._hl_cache = None
+        lbl._hl_cache_key = None
+        self._source_page_slot_data[slot_idx]["materialized"] = False
+
+    def _on_bg_source_pages_rendered(self, results: list, zoom: float) -> None:
+        """Main-thread callback: convert QImages → QPixmaps, store, materialise."""
+        self._pending_bg_source_worker = None
+
+        # Discard if the view has since been rebuilt at a different zoom / file
+        if not self._source_page_slots or zoom != round(self.zoom_level, 2):
+            return
+
+        for page_idx, qimg in results:
+            pixmap = QPixmap.fromImage(qimg)
+            self.source_renderer.store_pixmap(
+                self._source_virtual_file, page_idx, zoom, pixmap
+            )
+
+        # Materialise only pages still inside the visible buffer zone
+        viewport_height = self.source_scroll.viewport().height()
+        scroll_value = self.source_scroll.verticalScrollBar().value()
+        render_top = max(0, scroll_value - viewport_height)
+        render_bottom = scroll_value + 2 * viewport_height
+
+        for page_idx, _ in results:
+            if page_idx >= len(self._source_page_slot_data):
+                continue
+            y_off = self._source_page_y_offsets[page_idx]
+            _w, h = self._source_page_dims[page_idx]
+            if y_off + h >= render_top and y_off <= render_bottom:
+                self._materialize_source_page(page_idx)
+
+    def clear_results(self):
+        """Reset both viewers and all comparison state without clearing file lists."""
+        # Stop any in-flight work
+        if self._pending_bg_render_worker is not None:
+            self._pending_bg_render_worker.cancel()
+            self._pending_bg_render_worker = None
+        if self._pending_bg_source_worker is not None:
+            self._pending_bg_source_worker.cancel()
+            self._pending_bg_source_worker = None
+        self._refresh_timer.stop()
+
+        # Reset state
+        self.current_results = {}
+        self.current_target_file = None
+        self.current_match_list = []
+        self.current_match_index = 0
+        self.ignored_match_ids = set()
+        self.last_rendered_source = None
+        self.last_rendered_zoom = None
+        self._page_slots = []
+        self._page_slot_data = []
+        self._source_page_slots = []
+        self._source_page_slot_data = []
+
+        # Drain target layout and discard pool
+        while self.target_layout.count():
+            item = self.target_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.widget_pool.clear()
+
+        # Drain source layout
+        while self.source_layout.count():
+            item = self.source_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        # Clear legend
+        for i in reversed(range(self.legend_layout.count())):
+            self.legend_layout.itemAt(i).widget().setParent(None)
+
+        # Reset minimap
+        self.mini_map.set_data({}, {}, 1, None)
+
+        # Hide match navigation controls
+        self.btn_prev_match.setVisible(False)
+        self.btn_next_match.setVisible(False)
+        self.lbl_match_counter.setVisible(False)
+
+        # Reset source title
+        self.lbl_source_title.setText("<b>Matched Reference Viewer</b>")
+
+        # Invalidate render caches
+        self.target_renderer.invalidate_cache()
+        self.source_renderer.invalidate_cache()
+
+        # Update UI state
+        self.btn_clear.setEnabled(False)
+        self.lbl_stats_matches.setText("Matches: —")
+        self.update_stats()
+        self.status_bar.showMessage("Results cleared.", 3000)
+
+    def clear_index_cache(self):
+        """Delete all .pkl files from the on-disk reference index cache."""
+        if not _INDEX_CACHE_DIR.exists():
+            self.status_bar.showMessage("Index cache is already empty.", 3000)
+            return
+        files = list(_INDEX_CACHE_DIR.glob("*.pkl"))
+        for f in files:
+            f.unlink()
+        self.status_bar.showMessage(
+            f"Index cache cleared — {len(files)} file(s) removed.", 4000
+        )
 
     def handle_match_ignored(self, match):
         mid = match.get("match_id")
@@ -926,35 +1396,90 @@ class MainWindow(QMainWindow):
         )
 
         if should_rerender:
+            if self._pending_bg_source_worker is not None:
+                self._pending_bg_source_worker.cancel()
+                self._pending_bg_source_worker = None
+
             self.last_rendered_source = file_path
             self.last_rendered_zoom = self.zoom_level
 
-            # Clear existing widgets properly
+            # Drain existing source layout into pool
             while self.source_layout.count():
                 item = self.source_layout.takeAt(0)
                 widget = item.widget()
-                if widget:
+                if widget is not None:
                     widget.setParent(None)
-                    widget.deleteLater()
+                    widget.hide()
+                    self.widget_pool.append(widget)
+
+            self._source_page_slots = []
+            self._source_page_slot_data = []
+            self._source_virtual_file = file_path
 
             doc = fitz.open(file_path)
             zoom = self.zoom_level
+            zoom_key = round(zoom, 2)
+
+            # Compute page dims from the already-open doc (avoids a second fitz.open)
+            self._source_page_dims = [
+                (p.rect.width * zoom_key, p.rect.height * zoom_key) for p in doc
+            ]
+
+            self._source_page_y_offsets = []
+            y = 0
+            for _w, h in self._source_page_dims:
+                self._source_page_y_offsets.append(y)
+                y += h + 10
+
+            # Pre-render: first viewport + target page area (all while doc is open)
+            vh = max(self.source_scroll.viewport().height(), 600)
+            tp_y = (
+                self._source_page_y_offsets[tp]
+                if tp < len(self._source_page_y_offsets)
+                else 0
+            )
+            prerender_pages = list(
+                {
+                    i
+                    for i, y_off in enumerate(self._source_page_y_offsets)
+                    if y_off < vh * 2 or abs(y_off - tp_y) < vh * 1.5
+                }
+            )
+            self.source_renderer.batch_prerender(file_path, prerender_pages, zoom, doc)
+
+            # Build all widgets with empty pixmaps + fixed sizes; extract text
             full_text = ""
-
             for page_idx, page in enumerate(doc):
-                # Use cached pixmap
-                pixmap = self.source_renderer.get_cached_pixmap(
-                    file_path, page_idx, zoom
-                )
+                w_px, h_px = self._source_page_dims[page_idx]
 
-                lbl = PDFPageLabel(
-                    pixmap,
-                    [],
-                    {},
-                )
+                if self.widget_pool:
+                    lbl = self.widget_pool.pop()
+                    try:
+                        lbl.matchesClicked.disconnect()
+                    except (TypeError, RuntimeError):
+                        pass
+                    try:
+                        lbl.matchIgnored.disconnect()
+                    except (TypeError, RuntimeError):
+                        pass
+                    lbl.original_pixmap = QPixmap()
+                    lbl.highlights = []
+                    lbl.color_map = {}
+                    lbl.setPixmap(QPixmap())
+                    lbl._hl_cache = None
+                    lbl._hl_cache_key = None
+                else:
+                    lbl = PDFPageLabel(QPixmap(), [], {})
+
                 lbl.page_index = page_idx
+                lbl.setFixedSize(int(w_px), int(h_px))
+                lbl.show()
                 self.source_layout.addWidget(lbl)
                 self.source_layout.addSpacing(10)
+
+                self._source_page_slots.append(lbl)
+                self._source_page_slot_data.append({"materialized": False})
+
                 full_text += (
                     f"--- Page {page_idx + 1} ---\n" + page.get_text("text") + "\n\n"
                 )
@@ -999,47 +1524,38 @@ class MainWindow(QMainWindow):
                     all_highlights_by_page[page_idx] = []
                 all_highlights_by_page[page_idx].append((rect, True))
 
+        def _merge_rects(rects):
+            if not rects:
+                return []
+            rects = sorted(rects, key=lambda r: (r.y0, r.x0))
+            merged = []
+            curr = rects[0]
+            for nxt in rects[1:]:
+                if (
+                    max(0, min(curr.y1, nxt.y1) - max(curr.y0, nxt.y0))
+                    > (curr.y1 - curr.y0) * 0.5
+                    and nxt.x0 - curr.x1 < 30
+                ):
+                    curr.x1 = max(curr.x1, nxt.x1)
+                else:
+                    merged.append(curr)
+                    curr = nxt
+            merged.append(curr)
+            return merged
+
         target_widget = None
 
-        for i in range(self.source_layout.count()):
-            w = self.source_layout.itemAt(i).widget()
-            if not isinstance(w, PDFPageLabel):
-                continue
-
-            p_idx = w.page_index
+        for slot_idx, lbl in enumerate(self._source_page_slots):
+            p_idx = lbl.page_index
             page_highlight_data = all_highlights_by_page.get(p_idx, [])
 
-            # Separate current and other highlights
             current_rects = [r for r, is_curr in page_highlight_data if is_curr]
             other_rects = [r for r, is_curr in page_highlight_data if not is_curr]
 
-            # Sort and merge rects
-            def merge_rects(rects):
-                if not rects:
-                    return []
-                rects = sorted(rects, key=lambda r: (r.y0, r.x0))
-                merged = []
-                curr = rects[0]
-                for nxt in rects[1:]:
-                    if (
-                        max(0, min(curr.y1, nxt.y1) - max(curr.y0, nxt.y0))
-                        > (curr.y1 - curr.y0) * 0.5
-                        and nxt.x0 - curr.x1 < 30
-                    ):
-                        curr.x1 = max(curr.x1, nxt.x1)
-                    else:
-                        merged.append(curr)
-                        curr = nxt
-                merged.append(curr)
-                return merged
+            merged_current = _merge_rects(current_rects)
+            merged_other = _merge_rects(other_rects)
 
-            merged_current = merge_rects(current_rects)
-            merged_other = merge_rects(other_rects)
-
-            # Build highlight list with different sources for coloring
             highlights = []
-
-            # Add other matches (subtle)
             for r in merged_other:
                 highlights.append(
                     {
@@ -1047,11 +1563,9 @@ class MainWindow(QMainWindow):
                             r.x0 * zoom, r.y0 * zoom, r.x1 * zoom, r.y1 * zoom
                         ),
                         "source": "OTHER_MATCH",
-                        "confidence": 0.3,  # Low confidence for subtle rendering
+                        "confidence": 0.3,
                     }
                 )
-
-            # Add current match (prominent) - drawn last so it's on top
             for r in merged_current:
                 highlights.append(
                     {
@@ -1059,19 +1573,24 @@ class MainWindow(QMainWindow):
                             r.x0 * zoom, r.y0 * zoom, r.x1 * zoom, r.y1 * zoom
                         ),
                         "source": "CURRENT_MATCH",
-                        "confidence": 1.0,  # High confidence for prominent border
+                        "confidence": 1.0,
                     }
                 )
 
-            w.color_map = {
+            lbl.color_map = {
                 "OTHER_MATCH": other_color,
                 "CURRENT_MATCH": current_color,
             }
-            w.highlights = highlights
-            w.draw_highlights()
+            lbl.highlights = highlights
+            lbl._hl_cache_key = None  # invalidate cached highlight pixmap
+            if self._source_page_slot_data[slot_idx]["materialized"]:
+                lbl.draw_highlights()
 
             if p_idx == tp:
-                target_widget = w
+                target_widget = lbl
+
+        # Materialize visible source pages (first load or after highlight refresh)
+        QTimer.singleShot(0, self._update_visible_source_pages)
 
         # Text Edit Highlighting
         doc_obj = self.source_text_edit.document()
@@ -1110,6 +1629,31 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(
                     50, lambda: self.source_text_edit.ensureCursorVisible()
                 )
+
+    def keyPressEvent(self, event):
+        """Global keyboard shortcuts."""
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if event.key() == Qt.Key.Key_Plus or event.key() == Qt.Key.Key_Equal:
+                self.change_zoom(0.1)
+                event.accept()
+                return
+            elif event.key() == Qt.Key.Key_Minus:
+                self.change_zoom(-0.1)
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def wheelEvent(self, event):
+        """Handle Ctrl+Scroll for zooming."""
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            delta = event.angleDelta().y()
+            if delta > 0:
+                self.change_zoom(0.1)
+            elif delta < 0:
+                self.change_zoom(-0.1)
+            event.accept()
+        else:
+            super().wheelEvent(event)
 
     def closeEvent(self, event):
         """Clean up resources on window close."""
