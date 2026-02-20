@@ -338,12 +338,11 @@ class PDFPageLabel(QLabel):
     _popup = None
     _pending_preview_worker = None  # Track current preview worker for cancellation
 
-    def __init__(self, pixmap, highlights, color_map, scale_factor=1.0):
+    def __init__(self, pixmap, highlights, color_map):
         super().__init__()
         self.original_pixmap = pixmap
         self.highlights = highlights
         self.color_map = color_map
-        self.scale_factor = scale_factor
         self.page_index = 0
         # Highlight-render cache: avoids redrawing when inputs haven't changed
         self._hl_cache: QPixmap | None = None
@@ -498,7 +497,6 @@ class PDFPageLabel(QLabel):
         # Create worker
         worker = PreviewWorker(matches, self.color_map, match_ids)
         worker.signals.finished.connect(self._on_preview_loaded)
-        worker.signals.error.connect(self._on_preview_error)
 
         # Track current worker
         PDFPageLabel._pending_preview_worker = worker
@@ -512,11 +510,6 @@ class PDFPageLabel(QLabel):
         if match_ids == self._preview_request_ids:
             self._popup.set_images(pixmaps)
             PDFPageLabel._pending_preview_worker = None
-
-    def _on_preview_error(self, error_msg: str):
-        """Handle preview generation error."""
-        # Just hide the loading indicator on error
-        PDFPageLabel._pending_preview_worker = None
 
     def mousePressEvent(self, event: QMouseEvent):
         # Handle secondary mouse buttons for cycling

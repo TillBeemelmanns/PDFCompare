@@ -84,7 +84,6 @@ class PreviewSignals(QObject):
     """Signals for PreviewWorker (QRunnable can't have signals directly)."""
 
     finished = pyqtSignal(list, list)  # pixmaps, match_ids
-    error = pyqtSignal(str)
 
 
 class PreviewWorker(QRunnable):
@@ -115,73 +114,68 @@ class PreviewWorker(QRunnable):
         if self._cancelled:
             return
 
-        try:
-            pixmaps = []
+        pixmaps = []
 
-            for match in self.matches:
-                if self._cancelled:
-                    return
+        for match in self.matches:
+            if self._cancelled:
+                return
 
-                source_path = match.get("source")
-                data = match.get("source_data")
-                if not source_path or not data:
-                    continue
+            source_path = match.get("source")
+            data = match.get("source_data")
+            if not source_path or not data:
+                continue
 
-                page_idx = data[0][0]
-                rects = [fitz.Rect(item[1]) for item in data if item[0] == page_idx]
-                if not rects:
-                    continue
+            page_idx = data[0][0]
+            rects = [fitz.Rect(item[1]) for item in data if item[0] == page_idx]
+            if not rects:
+                continue
 
-                # Calculate bounding box
-                bbox = rects[0]
-                for r in rects[1:]:
-                    bbox |= r
+            # Calculate bounding box
+            bbox = rects[0]
+            for r in rects[1:]:
+                bbox |= r
 
-                # Add margin
-                margin = 30
-                bbox.x0 = max(0, bbox.x0 - margin)
-                bbox.y0 = max(0, bbox.y0 - margin)
-                bbox.x1 += margin
-                bbox.y1 += margin
+            # Add margin
+            margin = 30
+            bbox.x0 = max(0, bbox.x0 - margin)
+            bbox.y0 = max(0, bbox.y0 - margin)
+            bbox.x1 += margin
+            bbox.y1 += margin
 
-                # Render page region
-                doc = fitz.open(source_path)
-                page = doc[page_idx]
-                zoom = 1.5
-                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=bbox)
+            # Render page region
+            doc = fitz.open(source_path)
+            page = doc[page_idx]
+            zoom = 1.5
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=bbox)
 
-                qimg = QImage(
-                    pix.samples,
-                    pix.width,
-                    pix.height,
-                    pix.stride,
-                    QImage.Format.Format_RGB888,
-                ).copy()
+            qimg = QImage(
+                pix.samples,
+                pix.width,
+                pix.height,
+                pix.stride,
+                QImage.Format.Format_RGB888,
+            ).copy()
 
-                doc.close()
+            doc.close()
 
-                # Draw highlights
-                painter = QPainter(qimg)
-                color = self.color_map.get(source_path, QColor(255, 0, 0, 60))
-                if color.alpha() < 80:
-                    color.setAlpha(80)
-                painter.setBrush(color)
-                painter.setPen(Qt.PenStyle.NoPen)
+            # Draw highlights
+            painter = QPainter(qimg)
+            color = self.color_map.get(source_path, QColor(255, 0, 0, 60))
+            if color.alpha() < 80:
+                color.setAlpha(80)
+            painter.setBrush(color)
+            painter.setPen(Qt.PenStyle.NoPen)
 
-                for r in rects:
-                    rx0 = (r.x0 - bbox.x0) * zoom
-                    ry0 = (r.y0 - bbox.y0) * zoom
-                    painter.drawRect(QRectF(rx0, ry0, r.width * zoom, r.height * zoom))
+            for r in rects:
+                rx0 = (r.x0 - bbox.x0) * zoom
+                ry0 = (r.y0 - bbox.y0) * zoom
+                painter.drawRect(QRectF(rx0, ry0, r.width * zoom, r.height * zoom))
 
-                painter.end()
-                pixmaps.append(QPixmap.fromImage(qimg))
+            painter.end()
+            pixmaps.append(QPixmap.fromImage(qimg))
 
-            if not self._cancelled:
-                self.signals.finished.emit(pixmaps, self.match_ids)
-
-        except Exception as e:
-            if not self._cancelled:
-                self.signals.error.emit(str(e))
+        if not self._cancelled:
+            self.signals.finished.emit(pixmaps, self.match_ids)
 
 
 # Global thread pool for preview generation

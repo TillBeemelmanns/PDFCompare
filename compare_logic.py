@@ -16,13 +16,7 @@ from pathlib import Path
 from typing import Optional, Callable
 import numpy as np
 
-# Try to import Levenshtein for fuzzy matching
-try:
-    import Levenshtein
-
-    HAS_LEVENSHTEIN = True
-except ImportError:
-    HAS_LEVENSHTEIN = False
+import Levenshtein
 
 
 # Class-level constant for memory efficiency
@@ -215,7 +209,7 @@ class PDFComparator:
 
     Uses a two-phase approach:
     1. N-Gram shingling for fast candidate detection (parallelized)
-    2. Smith-Waterman alignment for precise match refinement (NumPy/Parasail optimized)
+    2. Smith-Waterman alignment for precise match refinement (NumPy-optimized)
     """
 
     def __init__(self, max_workers: int = 4):
@@ -391,11 +385,9 @@ class PDFComparator:
                 if progress_callback:
                     progress_callback(completed, total)
 
-    def _run_smith_waterman_numpy(self, seq1: list, seq2: list) -> tuple[list, float]:
+    def _run_smith_waterman(self, seq1: list, seq2: list) -> tuple[list, float]:
         """
         NumPy-optimized Smith-Waterman local alignment.
-
-        Uses vectorized operations for ~10x speedup over pure Python.
 
         Returns:
             Tuple of (aligned_indices, confidence_score)
@@ -479,13 +471,7 @@ class PDFComparator:
 
         return sorted(align_indices), min(1.0, confidence)
 
-    def _run_smith_waterman(self, seq1: list, seq2: list) -> tuple[list, float]:
-        """Run Smith-Waterman alignment (NumPy implementation)."""
-        return self._run_smith_waterman_numpy(seq1, seq2)
-
-    def _match_gram_chunk(
-        self, gram_chunk: list, mode: str, filtered_target: list
-    ) -> list:
+    def _match_gram_chunk(self, gram_chunk: list, mode: str) -> list:
         """
         Match a chunk of n-grams against the reference index (for parallel execution).
         """
@@ -504,10 +490,6 @@ class PDFComparator:
                             }
                         )
         else:  # fuzzy mode
-            if not HAS_LEVENSHTEIN:
-                # Fall back to fast mode if Levenshtein not available
-                return self._match_gram_chunk(gram_chunk, "fast", filtered_target)
-
             for filt_idx, target_gram in gram_chunk:
                 candidates = defaultdict(int)
                 target_str = " ".join(target_gram)
@@ -590,9 +572,7 @@ class PDFComparator:
             # Parallel matching for large documents
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = [
-                    executor.submit(
-                        self._match_gram_chunk, chunk, mode, filtered_target
-                    )
+                    executor.submit(self._match_gram_chunk, chunk, mode)
                     for chunk in chunks
                 ]
                 for future in as_completed(futures):
@@ -600,7 +580,7 @@ class PDFComparator:
         else:
             # Sequential for small documents or fuzzy mode
             for chunk in chunks:
-                raw_matches.extend(self._match_gram_chunk(chunk, mode, filtered_target))
+                raw_matches.extend(self._match_gram_chunk(chunk, mode))
 
         if progress_callback:
             progress_callback(40, "Merging match blocks...")
