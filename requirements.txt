@@ -1,11 +1,9 @@
 # Core dependencies
-PyQt6
-PyMuPDF
-psutil
-python-Levenshtein
+PyQt6>=6.5
+PyMuPDF>=1.23
+psutil>=5.9
+python-Levenshtein>=0.20
 
-# Performance optimizations
-numpy
+# Numerical / performance
+numpy>=1.24
 
-# Optional: SIMD-accelerated Smith-Waterman (install manually if needed)
-# parasail

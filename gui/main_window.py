@@ -545,11 +545,13 @@ class MainWindow(QMainWindow):
 
         btn_zoom_in_s = QPushButton("+")
         btn_zoom_in_s.setFixedSize(28, 28)
-        btn_zoom_in_s.setStyleSheet("font-size: 16px; font-weight: bold;")
+        btn_zoom_in_s.setStyleSheet("font-size: 16px; font-weight: bold; padding: 0px;")
         btn_zoom_in_s.clicked.connect(lambda: self.change_zoom(0.1))
         btn_zoom_out_s = QPushButton("-")
         btn_zoom_out_s.setFixedSize(28, 28)
-        btn_zoom_out_s.setStyleSheet("font-size: 16px; font-weight: bold;")
+        btn_zoom_out_s.setStyleSheet(
+            "font-size: 16px; font-weight: bold; padding: 0px;"
+        )
         btn_zoom_out_s.clicked.connect(lambda: self.change_zoom(-0.1))
         h_header.addWidget(btn_zoom_out_s)
         h_header.addWidget(btn_zoom_in_s)
@@ -625,11 +627,13 @@ class MainWindow(QMainWindow):
 
         btn_zoom_in_t = QPushButton("+")
         btn_zoom_in_t.setFixedSize(28, 28)
-        btn_zoom_in_t.setStyleSheet("font-size: 16px; font-weight: bold;")
+        btn_zoom_in_t.setStyleSheet("font-size: 16px; font-weight: bold; padding: 0px;")
         btn_zoom_in_t.clicked.connect(lambda: self.change_zoom(0.1))
         btn_zoom_out_t = QPushButton("-")
         btn_zoom_out_t.setFixedSize(28, 28)
-        btn_zoom_out_t.setStyleSheet("font-size: 16px; font-weight: bold;")
+        btn_zoom_out_t.setStyleSheet(
+            "font-size: 16px; font-weight: bold; padding: 0px;"
+        )
         btn_zoom_out_t.clicked.connect(lambda: self.change_zoom(-0.1))
         h_right_head.addWidget(btn_zoom_out_t)
         h_right_head.addWidget(btn_zoom_in_t)

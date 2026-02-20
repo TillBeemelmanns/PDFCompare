@@ -16,14 +16,6 @@ from pathlib import Path
 from typing import Optional, Callable
 import numpy as np
 
-# Try to import parasail for SIMD-accelerated alignment
-try:
-    import parasail
-
-    HAS_PARASAIL = True
-except ImportError:
-    HAS_PARASAIL = False
-
 # Try to import Levenshtein for fuzzy matching
 try:
     import Levenshtein
@@ -487,87 +479,8 @@ class PDFComparator:
 
         return sorted(align_indices), min(1.0, confidence)
 
-    def _run_smith_waterman_parasail(
-        self, seq1: list, seq2: list
-    ) -> tuple[list, float]:
-        """
-        Parasail-accelerated Smith-Waterman using SIMD instructions.
-
-        Significantly faster for longer sequences due to SIMD vectorization.
-
-        Returns:
-            Tuple of (aligned_indices, confidence_score)
-        """
-        if not seq1 or not seq2:
-            return [], 0.0
-
-        # Convert word lists to strings for parasail
-        # Use a character mapping to avoid collisions
-        unique_words = list(set(seq1) | set(seq2))
-        if len(unique_words) > 255:
-            # Fall back to numpy for very diverse vocabularies
-            return self._run_smith_waterman_numpy(seq1, seq2)
-
-        word_to_char = {w: chr(i + 1) for i, w in enumerate(unique_words)}
-
-        str1 = "".join(word_to_char.get(w, chr(0)) for w in seq1)
-        str2 = "".join(word_to_char.get(w, chr(0)) for w in seq2)
-
-        # Create simple scoring matrix (match=2, mismatch=-1)
-        matrix = parasail.matrix_create("ACGT", 2, -1)
-
-        # Run alignment
-        result = parasail.sw_trace_striped_16(str1, str2, 1, 1, matrix)
-
-        # Extract aligned indices from traceback
-        align_indices = []
-        cigar = result.cigar
-        match_count = 0
-
-        if cigar:
-            ref_pos = result.cigar.beg_ref
-            for i, (length, op) in enumerate(cigar.seq):
-                if op == 0:  # Match/Mismatch
-                    for j in range(length):
-                        if ref_pos + j < len(seq1):
-                            align_indices.append(ref_pos + j)
-                            # Count matches
-                            if seq1[ref_pos + j] == seq2[min(j, len(seq2) - 1)]:
-                                match_count += 1
-                    ref_pos += length
-                elif op == 1:  # Insertion
-                    pass
-                elif op == 2:  # Deletion
-                    ref_pos += length
-
-        # Calculate confidence score
-        min_len = min(len(seq1), len(seq2))
-        coverage = len(align_indices) / max(1, min_len)
-        identity = match_count / max(1, len(align_indices)) if align_indices else 0.0
-
-        # Approximate confidence
-        confidence = (identity * 0.5) + (coverage * 0.5)
-
-        return sorted(set(align_indices)), min(1.0, confidence)
-
     def _run_smith_waterman(self, seq1: list, seq2: list) -> tuple[list, float]:
-        """
-        Run Smith-Waterman alignment using best available implementation.
-
-        Returns:
-            Tuple of (aligned_indices, confidence_score)
-        """
-        # For short sequences, numpy is efficient enough
-        if len(seq1) * len(seq2) < 10000:
-            return self._run_smith_waterman_numpy(seq1, seq2)
-
-        # For longer sequences, try parasail if available
-        if HAS_PARASAIL:
-            try:
-                return self._run_smith_waterman_parasail(seq1, seq2)
-            except Exception:
-                pass
-
+        """Run Smith-Waterman alignment (NumPy implementation)."""
         return self._run_smith_waterman_numpy(seq1, seq2)
 
     def _match_gram_chunk(
