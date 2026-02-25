@@ -230,7 +230,7 @@ class PDFComparator:
         return hashlib.md5(raw.encode()).hexdigest()
 
     @staticmethod
-    def _load_index_cache(file_path: str) -> list | None:
+    def _load_index_cache(file_path: str) -> Optional[list]:
         key = PDFComparator._cache_key(file_path)
         cache_path = _INDEX_CACHE_DIR / f"{key}.pkl"
         if cache_path.exists():

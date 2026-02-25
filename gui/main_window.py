@@ -969,7 +969,7 @@ class MainWindow(QMainWindow):
             lbl.setFixedSize(int(w_px), int(h_px))
             lbl.show()
 
-            self.target_layout.addWidget(lbl)
+            self.target_layout.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignRight)
             self.target_layout.addSpacing(10)
 
             self._page_slots.append(lbl)
@@ -1478,7 +1478,7 @@ class MainWindow(QMainWindow):
                 lbl.page_index = page_idx
                 lbl.setFixedSize(int(w_px), int(h_px))
                 lbl.show()
-                self.source_layout.addWidget(lbl)
+                self.source_layout.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignRight)
                 self.source_layout.addSpacing(10)
 
                 self._source_page_slots.append(lbl)

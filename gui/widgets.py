@@ -8,7 +8,10 @@ This module provides specialized widgets for the PDF comparison interface:
 - MiniMapWidget: Document navigation heatmap
 """
 
+from __future__ import annotations
+
 from PyQt6.QtWidgets import (
+    QApplication,
     QListWidget,
     QLabel,
     QWidget,
@@ -439,7 +442,19 @@ class PDFPageLabel(QLabel):
                     self.current_match_ids = mids
                     self.load_image_previews(matches_here)
 
-                pop_pos = event.globalPosition().toPoint() + QPoint(20, 20)
+                global_pos = self.mapToGlobal(event.position().toPoint())
+                pop_pos = global_pos + QPoint(20, 20)
+                screen = (
+                    QApplication.screenAt(global_pos) or QApplication.primaryScreen()
+                )
+                if screen:
+                    sg = screen.availableGeometry()
+                    pw = self._popup.width() or 300
+                    ph = self._popup.height() or 200
+                    pop_pos.setX(min(pop_pos.x(), sg.right() - pw))
+                    pop_pos.setY(min(pop_pos.y(), sg.bottom() - ph))
+                    pop_pos.setX(max(pop_pos.x(), sg.left()))
+                    pop_pos.setY(max(pop_pos.y(), sg.top()))
                 self._popup.move(pop_pos)
                 if not self._popup.isVisible():
                     self._popup.show()
