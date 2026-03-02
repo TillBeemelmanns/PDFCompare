@@ -29,13 +29,17 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QComboBox,
     QApplication,
-    QFrame,
 )
 from PyQt6.QtGui import QColor, QPalette, QPixmap
 from PyQt6.QtCore import Qt, QThread, QTimer, QThreadPool
 
-from compare_logic import PDFComparator, _INDEX_CACHE_DIR
-from gui.widgets import FileListWidget, PDFPageLabel, MiniMapWidget
+from compare_logic import (
+    PDFComparator,
+    _INDEX_CACHE_DIR,
+    _IGNORE_PHRASES_FILE,
+    _normalize_ignore_phrase,
+)
+from gui.widgets import FileListWidget, PDFPageLabel, MiniMapWidget, SourcePanelWidget
 from gui.workers import CompareWorker, IndexWorker, PageRenderWorker
 from gui.pdf_renderer import PDFRenderer
 
@@ -115,10 +119,6 @@ class MainWindow(QMainWindow):
         self.target_renderer = PDFRenderer(max_bytes=256 * 1024 * 1024)  # 256 MB
         self.source_renderer = PDFRenderer(max_bytes=128 * 1024 * 1024)  # 128 MB
         self.process = psutil.Process(os.getpid())
-
-        # Color mapping for sources
-        self.color_map = {}
-        self.colors = Theme.HIGHLIGHT_COLORS
 
         # State
         self.zoom_level = 1.2
@@ -334,127 +334,145 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.setCentralWidget(splitter)
 
-        # Left Panel with Scroll Area
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        left_scroll.setMinimumWidth(280)
-
+        # Left Panel — plain widget so stretch factors work (no outer scroll area)
         left_panel = QWidget()
+        left_panel.setMinimumWidth(260)
+        left_panel.setMaximumWidth(360)
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(12, 12, 12, 12)
-        left_layout.setSpacing(8)
-        left_scroll.setWidget(left_panel)
+        left_layout.setContentsMargins(8, 8, 8, 8)
+        left_layout.setSpacing(4)
 
-        # Algorithm Parameters Group
+        # Algorithm Parameters Group (compact)
         gb_config = QGroupBox("Algorithm Parameters")
         gb_layout = QVBoxLayout()
-        gb_layout.setSpacing(6)
+        gb_layout.setSpacing(3)
+        gb_layout.setContentsMargins(6, 6, 6, 6)
 
-        lbl_phase_a = QLabel("<b>Phase A: Matching</b>")
-        lbl_phase_a.setStyleSheet(f"color: {Theme.LAVENDER}; font-size: 11px;")
+        # Phase A row: seed + merge + mode packed tightly
+        lbl_phase_a = QLabel("Phase A: Matching")
+        lbl_phase_a.setStyleSheet(
+            f"color: {Theme.LAVENDER}; font-size: 10px; font-weight: bold;"
+        )
         gb_layout.addWidget(lbl_phase_a)
 
-        hbox_seed = QHBoxLayout()
-        hbox_seed.addWidget(QLabel("Seed Size (words):"))
+        row_seed = QHBoxLayout()
+        row_seed.setSpacing(4)
+        lbl_seed = QLabel("Seed:")
+        lbl_seed.setStyleSheet("font-size: 11px;")
+        lbl_seed.setToolTip("Minimum words that must match to form a candidate block.")
+        row_seed.addWidget(lbl_seed)
         self.spin_seed = QSpinBox()
         self.spin_seed.setRange(2, 10)
         self.spin_seed.setValue(3)
+        self.spin_seed.setFixedWidth(52)
         self.spin_seed.setToolTip(
             "Minimum number of consecutive words that must match to form a\n"
             "candidate block. Higher = fewer but more reliable matches."
         )
-        hbox_seed.addWidget(self.spin_seed)
-        gb_layout.addLayout(hbox_seed)
-
-        hbox_merge = QHBoxLayout()
-        hbox_merge.addWidget(QLabel("Merge Gap (words):"))
+        row_seed.addWidget(self.spin_seed)
+        lbl_merge = QLabel("Gap:")
+        lbl_merge.setStyleSheet("font-size: 11px;")
+        lbl_merge.setToolTip("Maximum word gap merged into one block.")
+        row_seed.addWidget(lbl_merge)
         self.spin_merge = QSpinBox()
         self.spin_merge.setRange(0, 100)
         self.spin_merge.setValue(15)
+        self.spin_merge.setFixedWidth(52)
         self.spin_merge.setToolTip(
             "Maximum word gap between two adjacent matches that will be\n"
             "merged into a single block. Higher = fewer, larger blocks."
         )
-        hbox_merge.addWidget(self.spin_merge)
-        gb_layout.addLayout(hbox_merge)
+        row_seed.addWidget(self.spin_merge)
+        gb_layout.addLayout(row_seed)
 
-        hbox_mode = QHBoxLayout()
-        hbox_mode.addWidget(QLabel("Compare Mode:"))
         self.combo_mode = QComboBox()
         self.combo_mode.addItems(["Fast (Exact N-Gram)", "Fuzzy (Levenshtein)"])
         self.combo_mode.setToolTip(
             "Fast: exact n-gram matching — best for identical or near-identical text.\n"
             "Fuzzy: Levenshtein distance allows minor typos and OCR errors (slower)."
         )
-        hbox_mode.addWidget(self.combo_mode)
-        gb_layout.addLayout(hbox_mode)
+        gb_layout.addWidget(self.combo_mode)
 
-        gb_layout.addSpacing(10)
-        lbl_phase_b = QLabel("<b>Phase B: Refinement</b>")
-        lbl_phase_b.setStyleSheet(f"color: {Theme.LAVENDER}; font-size: 11px;")
+        # Phase B row: SW checkbox + lookahead in one line
+        lbl_phase_b = QLabel("Phase B: Refinement")
+        lbl_phase_b.setStyleSheet(
+            f"color: {Theme.LAVENDER}; font-size: 10px; font-weight: bold;"
+        )
         gb_layout.addWidget(lbl_phase_b)
 
-        self.chk_sw_refinement = QCheckBox("Enable Smith-Waterman Refinement")
+        row_sw = QHBoxLayout()
+        row_sw.setSpacing(4)
+        self.chk_sw_refinement = QCheckBox("Smith-Waterman")
         self.chk_sw_refinement.setChecked(True)
+        self.chk_sw_refinement.setStyleSheet("font-size: 11px;")
         self.chk_sw_refinement.setToolTip(
             "Refines n-gram candidates with Smith-Waterman local alignment.\n"
             "Produces precise match boundaries and a confidence score (0–1).\n"
             "Disable for a faster but coarser result."
         )
-        gb_layout.addWidget(self.chk_sw_refinement)
-
-        hbox_expansion = QHBoxLayout()
-        hbox_expansion.addWidget(QLabel("Context Lookahead:"))
+        row_sw.addWidget(self.chk_sw_refinement, 1)
+        lbl_exp = QLabel("Ctx:")
+        lbl_exp.setStyleSheet("font-size: 11px;")
+        lbl_exp.setToolTip("Context lookahead words beyond each n-gram boundary.")
+        row_sw.addWidget(lbl_exp)
         self.spin_expansion = QSpinBox()
         self.spin_expansion.setRange(0, 50)
         self.spin_expansion.setValue(1)
+        self.spin_expansion.setFixedWidth(52)
         self.spin_expansion.setToolTip(
             "Extra words inspected beyond each n-gram match boundary when\n"
             "running Smith-Waterman. Helps capture leading/trailing context\n"
             "that the n-gram phase may have clipped."
         )
-        hbox_expansion.addWidget(self.spin_expansion)
-        gb_layout.addLayout(hbox_expansion)
+        row_sw.addWidget(self.spin_expansion)
+        gb_layout.addLayout(row_sw)
 
         gb_config.setLayout(gb_layout)
         left_layout.addWidget(gb_config)
 
-        # Reference Files
-        left_layout.addWidget(QLabel("Reference PDFs:"))
+        # Reference Files — create list first, then header row with inline clear button
         self.reference_list = FileListWidget("References")
-        self.reference_list.setMinimumHeight(120)
+        self.reference_list.setMinimumHeight(70)
+        self.reference_list.setMaximumHeight(120)
+
+        row_ref_hdr = QHBoxLayout()
+        row_ref_hdr.setContentsMargins(0, 0, 0, 0)
+        row_ref_hdr.addWidget(QLabel("Reference PDFs:"))
+        row_ref_hdr.addStretch()
+        btn_clr_ref = QPushButton("Clear")
+        btn_clr_ref.setFixedHeight(22)
+        btn_clr_ref.setStyleSheet("font-size: 10px; padding: 0 6px;")
+        btn_clr_ref.clicked.connect(self.reference_list.clear)
+        row_ref_hdr.addWidget(btn_clr_ref)
+        left_layout.addLayout(row_ref_hdr)
         left_layout.addWidget(self.reference_list)
 
-        btn_clr_ref = QPushButton("Clear References")
-        btn_clr_ref.clicked.connect(self.reference_list.clear)
-        left_layout.addWidget(btn_clr_ref)
+        # Target File — same pattern
+        self.target_list = FileListWidget("Target", single_file=True)
+        self.target_list.setFixedHeight(62)
 
-        left_layout.addSpacing(10)
-
-        # Target File
-        left_layout.addWidget(QLabel("Target PDF:"))
-        self.target_list = FileListWidget("Target")
-        self.target_list.setFixedHeight(80)
-        left_layout.addWidget(self.target_list)
-
-        btn_clr_tgt = QPushButton("Clear Target")
+        row_tgt_hdr = QHBoxLayout()
+        row_tgt_hdr.setContentsMargins(0, 0, 0, 0)
+        row_tgt_hdr.addWidget(QLabel("Target PDF:"))
+        row_tgt_hdr.addStretch()
+        btn_clr_tgt = QPushButton("Clear")
+        btn_clr_tgt.setFixedHeight(22)
+        btn_clr_tgt.setStyleSheet("font-size: 10px; padding: 0 6px;")
         btn_clr_tgt.clicked.connect(self.target_list.clear)
-        left_layout.addWidget(btn_clr_tgt)
-
-        left_layout.addSpacing(10)
+        row_tgt_hdr.addWidget(btn_clr_tgt)
+        left_layout.addLayout(row_tgt_hdr)
+        left_layout.addWidget(self.target_list)
 
         # Run Button
         self.btn_run = QPushButton("▶  Run Comparison")
-        self.btn_run.setFixedHeight(44)
+        self.btn_run.setFixedHeight(36)
         self.btn_run.setStyleSheet(f"""
             QPushButton {{
                 background-color: {Theme.GREEN};
                 color: {Theme.CRUST};
                 font-weight: bold;
-                font-size: 13px;
-                border-radius: 8px;
+                font-size: 12px;
+                border-radius: 6px;
                 border: none;
             }}
             QPushButton:hover {{
@@ -475,63 +493,77 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFixedHeight(18)
         left_layout.addWidget(self.progress_bar)
 
-        # Clear Results button
+        # Utility buttons — 2 per row to save vertical space
+        row_util1 = QHBoxLayout()
+        row_util1.setSpacing(4)
         self.btn_clear = QPushButton("✕  Clear Results")
         self.btn_clear.setEnabled(False)
+        self.btn_clear.setFixedHeight(26)
+        self.btn_clear.setStyleSheet("font-size: 11px;")
         self.btn_clear.setToolTip("Remove comparison results and reset both viewers.")
         self.btn_clear.clicked.connect(self.clear_results)
-        left_layout.addWidget(self.btn_clear)
+        row_util1.addWidget(self.btn_clear)
 
-        # Clear Index Cache button
-        btn_clear_cache = QPushButton("🗑  Clear Index Cache")
+        btn_clear_cache = QPushButton("🗑  Cache")
+        btn_clear_cache.setFixedHeight(26)
+        btn_clear_cache.setStyleSheet("font-size: 11px;")
         btn_clear_cache.setToolTip(
             "Delete all cached reference index files from ~/.pdfcompare/index_cache/.\n"
             "Forces a full re-parse of reference PDFs on the next run."
         )
         btn_clear_cache.clicked.connect(self.clear_index_cache)
-        left_layout.addWidget(btn_clear_cache)
+        row_util1.addWidget(btn_clear_cache)
+        left_layout.addLayout(row_util1)
 
-        left_layout.addSpacing(10)
+        btn_ignored = QPushButton("⊘  Edit Ignored Phrases")
+        btn_ignored.setFixedHeight(26)
+        btn_ignored.setStyleSheet("font-size: 11px;")
+        btn_ignored.setToolTip(
+            "Open ~/.pdfcompare/ignored_phrases.txt in your default text editor.\n"
+            "One phrase per line. Changes take effect on the next Run Comparison."
+        )
+        btn_ignored.clicked.connect(self.open_ignored_phrases_file)
+        left_layout.addWidget(btn_ignored)
 
-        # Legend
-        left_layout.addWidget(QLabel("Legend:"))
-        self.legend_layout = QVBoxLayout()
-        left_layout.addLayout(self.legend_layout)
+        # Source panel — takes all remaining vertical space
+        self.source_panel = SourcePanelWidget()
+        self.source_panel.selection_changed.connect(self.refresh_target_view)
+        self.source_panel.file_browse_requested.connect(self._browse_reference_pdf)
+        left_layout.addWidget(self.source_panel, 1)
 
-        # Statistics
-        left_layout.addStretch()
+        # Statistics (compact — 2 lines)
         gb_stats = QGroupBox("Statistics")
-        self.stats_layout = QVBoxLayout()
+        stats_grid = QHBoxLayout()
+        stats_grid.setSpacing(8)
         self.lbl_stats_ngrams = QLabel("N-Grams: 0")
         self.lbl_stats_mem = QLabel("Memory: 0 MB")
         self.lbl_stats_cache = QLabel("Cache: 0 pages")
         self.lbl_stats_matches = QLabel("Matches: —")
+        for lbl in (
+            self.lbl_stats_ngrams,
+            self.lbl_stats_mem,
+            self.lbl_stats_cache,
+            self.lbl_stats_matches,
+        ):
+            lbl.setStyleSheet("font-size: 10px;")
         self.lbl_stats_mem.setToolTip(
             "Total Resident Set Size (RSS) of the application process."
         )
-        self.stats_layout.addWidget(self.lbl_stats_ngrams)
-        self.stats_layout.addWidget(self.lbl_stats_mem)
-        self.stats_layout.addWidget(self.lbl_stats_cache)
-        self.stats_layout.addWidget(self.lbl_stats_matches)
-        gb_stats.setLayout(self.stats_layout)
+        stats_col = QVBoxLayout()
+        stats_col.setSpacing(1)
+        row_s1 = QHBoxLayout()
+        row_s1.addWidget(self.lbl_stats_ngrams)
+        row_s1.addWidget(self.lbl_stats_mem)
+        row_s2 = QHBoxLayout()
+        row_s2.addWidget(self.lbl_stats_cache)
+        row_s2.addWidget(self.lbl_stats_matches)
+        stats_col.addLayout(row_s1)
+        stats_col.addLayout(row_s2)
+        gb_stats.setLayout(stats_col)
         left_layout.addWidget(gb_stats)
-
-        # Shortcuts Indicator
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        line.setStyleSheet(f"background-color: {Theme.SURFACE1};")
-        left_layout.addWidget(line)
-
-        lbl_shortcuts = QLabel(
-            "<b>Shortcuts (Hover match):</b><br>Space: Next Match<br>Mouse Side: Back/Forward"
-        )
-        lbl_shortcuts.setStyleSheet(
-            f"color: {Theme.OVERLAY1}; font-size: 10px; padding: 5px;"
-        )
-        left_layout.addWidget(lbl_shortcuts)
 
         # Middle Panel (Reference Viewer)
         middle_wrapper = QWidget()
@@ -657,7 +689,7 @@ class MainWindow(QMainWindow):
         )
 
         # Add panels to splitter
-        splitter.addWidget(left_scroll)
+        splitter.addWidget(left_panel)
         splitter.addWidget(middle_wrapper)
         splitter.addWidget(right_wrapper)
         splitter.setStretchFactor(0, 1)
@@ -705,12 +737,7 @@ class MainWindow(QMainWindow):
         if not self.current_results:
             return
 
-        # Collect active files from legend
-        active_files = set()
-        for i in range(self.legend_layout.count()):
-            w = self.legend_layout.itemAt(i).widget()
-            if isinstance(w, QCheckBox) and w.isChecked():
-                active_files.add(w.property("file_path"))
+        active_files = self.source_panel.get_active_files()
 
         # Filter results
         filtered = {}
@@ -724,13 +751,24 @@ class MainWindow(QMainWindow):
             if fm:
                 filtered[p_idx] = fm
 
-        self.render_target(self.current_target_file, filtered)
+        saved_scroll = self.target_scroll.verticalScrollBar().value()
+        self.render_target(
+            self.current_target_file, filtered, restore_scroll=saved_scroll
+        )
         self.mini_map.set_data(
             filtered,
-            self.color_map,
             self.current_total_pages,
             getattr(self, "current_page_heights", None),
         )
+
+    def _on_worker_error(self, title: str, message: str, thread: QThread) -> None:
+        """Handle an error emitted by a background worker: stop thread, reset UI."""
+        thread.quit()
+        thread.wait()
+        self.btn_run.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.status_bar.showMessage(f"{title}: {message}", 10000)
+        QMessageBox.critical(self, title, message)
 
     def run_comparison(self):
         rf, tf = self.reference_list.get_files(), self.target_list.get_files()
@@ -755,6 +793,9 @@ class MainWindow(QMainWindow):
         self.index_thread.started.connect(self.index_worker.run)
         self.index_worker.finished.connect(self.on_index_finished)
         self.index_worker.progress.connect(self.on_index_progress)
+        self.index_worker.error.connect(
+            lambda msg: self._on_worker_error("Indexing failed", msg, self.index_thread)
+        )
         self.index_thread.start()
 
     def on_index_progress(self, percent: int, message: str):
@@ -787,6 +828,11 @@ class MainWindow(QMainWindow):
         self.compare_thread.started.connect(self.compare_worker.run)
         self.compare_worker.finished.connect(self.on_compare_finished)
         self.compare_worker.progress.connect(self.on_compare_progress)
+        self.compare_worker.error.connect(
+            lambda msg: self._on_worker_error(
+                "Comparison failed", msg, self.compare_thread
+            )
+        )
         self.compare_thread.start()
 
     def on_compare_progress(self, percent: int, message: str):
@@ -811,37 +857,7 @@ class MainWindow(QMainWindow):
         self.current_page_heights = [p.rect.height for p in doc]
         doc.close()
 
-        # Clear legend
-        for i in reversed(range(self.legend_layout.count())):
-            self.legend_layout.itemAt(i).widget().setParent(None)
-
-        # Build color map
-        rf = self.reference_list.get_files()
-        for i, fp in enumerate(rf):
-            self.color_map[fp] = self.colors[i % len(self.colors)]
-
-        # Build legend sorted by match count
-        for fp in sorted(rf, key=lambda x: source_stats.get(x, 0), reverse=True):
-            color = self.color_map[fp]
-            mc = source_stats.get(fp, 0)
-            percentage = (mc / total_words * 100) if total_words > 0 else 0
-
-            chk = QCheckBox(f"{os.path.basename(fp)}: {percentage:.1f}% ({mc} words)")
-            chk.setChecked(True)
-            chk.setProperty("file_path", fp)
-            chk.stateChanged.connect(self.refresh_target_view)
-            chk.setStyleSheet(f"""
-                QCheckBox {{
-                    padding: 8px;
-                    border-radius: 6px;
-                    background-color: rgba({color.red()}, {color.green()}, {color.blue()}, 60);
-                    font-size: 11px;
-                }}
-                QCheckBox:hover {{
-                    background-color: rgba({color.red()}, {color.green()}, {color.blue()}, 80);
-                }}
-            """)
-            self.legend_layout.addWidget(chk)
+        self.source_panel.populate(source_stats, total_words)
 
         self.btn_clear.setEnabled(True)
 
@@ -876,7 +892,7 @@ class MainWindow(QMainWindow):
         )
         self.lbl_stats_cache.setText(f"Cache: {total_cached} pages / {total_mb:.0f} MB")
 
-    def render_target(self, file_path, results):
+    def render_target(self, file_path, results, restore_scroll=None):
         """
         Render target document using pixmap-swap lazy loading.
 
@@ -955,16 +971,21 @@ class MainWindow(QMainWindow):
                     lbl.matchIgnored.disconnect()
                 except (TypeError, RuntimeError):
                     pass
+                try:
+                    lbl.matchPhraseIgnored.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
                 lbl.original_pixmap = QPixmap()
                 lbl.highlights = highlights
-                lbl.color_map = self.color_map
+                lbl.color_map = {}
                 lbl.setPixmap(QPixmap())
             else:
-                lbl = PDFPageLabel(QPixmap(), highlights, self.color_map)
+                lbl = PDFPageLabel(QPixmap(), highlights, {})
 
             lbl.page_index = page_idx
             lbl.matchesClicked.connect(self.handle_matches_clicked)
             lbl.matchIgnored.connect(self.handle_match_ignored)
+            lbl.matchPhraseIgnored.connect(self.handle_phrase_ignored)
             # Fixed size keeps layout stable when pixmap is cleared
             lbl.setFixedSize(int(w_px), int(h_px))
             lbl.show()
@@ -977,8 +998,18 @@ class MainWindow(QMainWindow):
                 {"highlights": highlights, "materialized": False}
             )
 
-        # Let Qt finish the layout pass, then materialize the visible pages
-        QTimer.singleShot(0, self._update_visible_target_pages)
+        # Let Qt finish the layout pass, then materialize the visible pages.
+        # If a scroll position was saved before the layout drain, restore it first
+        # so the view doesn't jump to the top (or last widget) on refresh.
+        if restore_scroll is not None:
+
+            def _restore_and_materialize():
+                self.target_scroll.verticalScrollBar().setValue(restore_scroll)
+                self._update_visible_target_pages()
+
+            QTimer.singleShot(0, _restore_and_materialize)
+        else:
+            QTimer.singleShot(0, self._update_visible_target_pages)
 
     def _on_target_scroll(self, value: int) -> None:
         """Called on every scroll-bar value change in the target view."""
@@ -1250,12 +1281,11 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.deleteLater()
 
-        # Clear legend
-        for i in reversed(range(self.legend_layout.count())):
-            self.legend_layout.itemAt(i).widget().setParent(None)
+        self.source_panel.clear()
+        self.source_panel.set_active_file(None)
 
         # Reset minimap
-        self.mini_map.set_data({}, {}, 1, None)
+        self.mini_map.set_data({}, 1, None)
 
         # Hide match navigation controls
         self.btn_prev_match.setVisible(False)
@@ -1275,6 +1305,32 @@ class MainWindow(QMainWindow):
         self.update_stats()
         self.status_bar.showMessage("Results cleared.", 3000)
 
+    def load_files(self, target: str, refs: list, auto_run: bool = False) -> None:
+        """Populate file lists from CLI arguments (called after the window is shown)."""
+        for path in refs:
+            if path not in self.reference_list.get_files():
+                self.reference_list.addItem(path)
+        if target and target not in self.target_list.get_files():
+            self.target_list.addItem(target)
+        if auto_run and target and refs:
+            QTimer.singleShot(200, self.run_comparison)
+
+    def open_ignored_phrases_file(self):
+        """Open the ignored-phrases file in the system's default text editor."""
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+
+        # Ensure the file exists so the editor opens something tangible
+        _IGNORE_PHRASES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not _IGNORE_PHRASES_FILE.exists():
+            _IGNORE_PHRASES_FILE.write_text(
+                "# PDFCompare — globally ignored phrases\n"
+                "# One phrase per line, case-insensitive.\n"
+                "# Changes take effect on the next Run Comparison.\n",
+                encoding="utf-8",
+            )
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(_IGNORE_PHRASES_FILE)))
+
     def clear_index_cache(self):
         """Delete all .pkl files from the on-disk reference index cache."""
         if not _INDEX_CACHE_DIR.exists():
@@ -1286,6 +1342,56 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(
             f"Index cache cleared — {len(files)} file(s) removed.", 4000
         )
+
+    def handle_phrase_ignored(self, match):
+        """Persist the matched phrase to disk and immediately hide every block
+        whose text contains the same phrase — not just the one right-clicked."""
+        match_id = match.get("match_id")
+        if not match_id:
+            return
+
+        # Reconstruct the phrase from the clicked block (page-order word join).
+        phrase_words = []
+        for page_idx in sorted(self.current_results):
+            for h in self.current_results[page_idx]:
+                if h.get("match_id") == match_id:
+                    phrase_words.append(h.get("word", ""))
+
+        phrase = " ".join(phrase_words).strip().lower()
+        if not phrase:
+            return
+
+        # Normalise the same way compare_document normalises block_text so the
+        # substring check below is consistent with what happens on re-run.
+        normalized = _normalize_ignore_phrase(phrase)
+
+        # Collect words for every distinct match_id in the current results,
+        # then suppress all blocks whose text contains the normalized phrase.
+        match_words: dict = {}
+        for page_idx in sorted(self.current_results):
+            for h in self.current_results[page_idx]:
+                mid = h.get("match_id")
+                if mid is not None:
+                    match_words.setdefault(mid, []).append(h.get("word", ""))
+
+        newly_ignored = 0
+        for mid, words in match_words.items():
+            block_text = " ".join(w.lower() for w in words)
+            if normalized in block_text:
+                self.ignored_match_ids.add(mid)
+                newly_ignored += 1
+
+        # Append to the ignore file (create it and its parent dir if needed).
+        _IGNORE_PHRASES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _IGNORE_PHRASES_FILE.open("a", encoding="utf-8") as f:
+            f.write(phrase + "\n")
+
+        self.status_bar.showMessage(
+            f'Ignored "{phrase[:60]}{"…" if len(phrase) > 60 else ""}" '
+            f"— {newly_ignored} block(s) suppressed.",
+            5000,
+        )
+        self.refresh_target_view()
 
     def handle_match_ignored(self, match):
         mid = match.get("match_id")
@@ -1367,6 +1473,10 @@ class MainWindow(QMainWindow):
                 current_match_idx=self.current_match_index,
             )
 
+    def _browse_reference_pdf(self, file_path: str) -> None:
+        """Open a reference PDF in the viewer without jumping to a specific match."""
+        self.load_source_view(file_path, source_data=[])
+
     def load_source_view(
         self,
         file_path,
@@ -1383,16 +1493,21 @@ class MainWindow(QMainWindow):
             all_matches: Optional list of all matches to show (for multi-match view)
             current_match_idx: Index of the current/active match in all_matches
         """
-        if not source_data:
-            return
-
-        tp = source_data[0][0]
-        self.lbl_source_title.setText(
-            f"Viewing Reference: <b>{os.path.basename(file_path)}</b>"
-        )
-        self.status_bar.showMessage(
-            f"Jumped to match in '{os.path.basename(file_path)}' (Page {tp + 1})", 5000
-        )
+        tp = source_data[0][0] if source_data else None
+        name = os.path.basename(file_path)
+        display_name = name if len(name) <= 40 else name[:37] + "…"
+        self.lbl_source_title.setText(f"Viewing Reference: <b>{display_name}</b>")
+        self.lbl_source_title.setToolTip(file_path)
+        self.source_panel.set_active_file(file_path)
+        if tp is not None:
+            self.status_bar.showMessage(
+                f"Jumped to match in '{os.path.basename(file_path)}' (Page {tp + 1})",
+                5000,
+            )
+        else:
+            self.status_bar.showMessage(
+                f"Browsing reference: '{os.path.basename(file_path)}'", 3000
+            )
 
         should_rerender = (
             file_path != self.last_rendered_source
@@ -1439,7 +1554,7 @@ class MainWindow(QMainWindow):
             vh = max(self.source_scroll.viewport().height(), 600)
             tp_y = (
                 self._source_page_y_offsets[tp]
-                if tp < len(self._source_page_y_offsets)
+                if tp is not None and tp < len(self._source_page_y_offsets)
                 else 0
             )
             prerender_pages = list(
@@ -1464,6 +1579,10 @@ class MainWindow(QMainWindow):
                         pass
                     try:
                         lbl.matchIgnored.disconnect()
+                    except (TypeError, RuntimeError):
+                        pass
+                    try:
+                        lbl.matchPhraseIgnored.disconnect()
                     except (TypeError, RuntimeError):
                         pass
                     lbl.original_pixmap = QPixmap()
@@ -1494,16 +1613,8 @@ class MainWindow(QMainWindow):
         # Build highlights for all matches from this source
         zoom = self.zoom_level
 
-        # Get base color for this source
-        base_color = self.color_map.get(file_path, QColor(255, 255, 0, 80))
-
-        # Current match: bright gold color (high confidence draws border automatically)
-        current_color = QColor(255, 180, 50, 100)  # Bright gold
-
-        # Other matches: subtle, muted version of base color
-        other_color = QColor(
-            base_color.red(), base_color.green(), base_color.blue(), 40
-        )
+        current_color = QColor(255, 180, 50, 110)  # gold
+        other_color = QColor(250, 170, 30, 40)  # amber-muted
 
         # Collect all source_data from all matches for this file
         all_highlights_by_page = {}  # {page_idx: [(rect, is_current), ...]}

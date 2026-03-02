@@ -201,6 +201,37 @@ STOPWORDS = frozenset(
 
 
 _INDEX_CACHE_DIR = Path.home() / ".pdfcompare" / "index_cache"
+_IGNORE_PHRASES_FILE = Path.home() / ".pdfcompare" / "ignored_phrases.txt"
+
+
+def _normalize_ignore_phrase(phrase: str) -> str:
+    """Normalize a phrase so it can be compared against block_text.
+
+    block_text is built from filtered_target words (stopwords already removed,
+    punctuation stripped, lowercased). Apply the same transformation here so
+    that phrases manually entered with stopwords still match correctly.
+    """
+    words = []
+    for token in phrase.split():
+        stripped = token.strip(".,;:!?\"'()[]{}«»–—")
+        norm = "".join(c for c in stripped if c.isalnum()).lower()
+        if norm and norm not in STOPWORDS:
+            words.append(stripped.lower())
+    return " ".join(words)
+
+
+def load_ignored_phrases() -> frozenset:
+    """Return a frozenset of normalized phrases that should be excluded from results."""
+    if not _IGNORE_PHRASES_FILE.exists():
+        return frozenset()
+    phrases = set()
+    for line in _IGNORE_PHRASES_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            normalized = _normalize_ignore_phrase(line)
+            if normalized:
+                phrases.add(normalized)
+    return frozenset(phrases)
 
 
 class PDFComparator:
@@ -635,6 +666,8 @@ class PDFComparator:
         final_highlights = defaultdict(list)
         source_word_counts = defaultdict(set)
 
+        ignored_phrases = load_ignored_phrases()
+
         total_blocks = len(merged_blocks)
         for block_idx, block in enumerate(merged_blocks):
             if block["end"] - block["start"] < 3:
@@ -669,6 +702,19 @@ class PDFComparator:
                 block_len = block["end"] - block["start"]
                 confidence = min(1.0, 0.5 + (block_len / 20.0) * 0.5)
 
+            # Skip blocks whose final aligned text matches a globally ignored phrase.
+            # This check is done AFTER Smith-Waterman so `indices` contains the full
+            # matched word set (seed_size alone is often too short to match the phrase).
+            if ignored_phrases:
+                block_text = " ".join(
+                    w.strip(".,;:!?\"'()[]{}«»–—").lower()
+                    for i in indices
+                    if i < len(filtered_target)
+                    for _, _, w in filtered_target[i][2]
+                )
+                if any(phrase in block_text for phrase in ignored_phrases):
+                    continue
+
             # Build source info
             source_info = []
             if block["src"] in self.reference_maps:
@@ -687,6 +733,7 @@ class PDFComparator:
                         final_highlights[p].append(
                             {
                                 "rect": r,
+                                "word": w.strip(".,;:!?\"'()[]{}«»–—"),
                                 "source": block["src"],
                                 "source_data": source_info,
                                 "match_id": match_id,

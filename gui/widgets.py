@@ -12,12 +12,19 @@ from __future__ import annotations
 
 from PyQt6.QtWidgets import (
     QApplication,
-    QListWidget,
-    QLabel,
-    QWidget,
-    QMenu,
-    QVBoxLayout,
+    QCheckBox,
+    QDoubleSpinBox,
+    QFrame,
     QGraphicsDropShadowEffect,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMenu,
+    QProgressBar,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
 )
 from PyQt6.QtGui import (
     QPainter,
@@ -129,14 +136,19 @@ class FileListWidget(QListWidget):
     - File count preview during drag
     - Validation feedback for non-PDF files
     - Support for folder drops (recursive PDF discovery)
+
+    When single_file=True the widget only accepts a single PDF file:
+    folders are rejected, multiple-file drops are rejected, and a new
+    drop replaces the existing entry.
     """
 
     files_changed = pyqtSignal()  # Emitted when file list changes
 
-    def __init__(self, title, parent=None):
+    def __init__(self, title, parent=None, single_file=False):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.title = title
+        self.single_file = single_file
         self.setAlternatingRowColors(True)
         self._setup_styles()
         self._drag_count = 0
@@ -229,16 +241,33 @@ class FileListWidget(QListWidget):
         )
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            # Count valid PDFs
-            urls = event.mimeData().urls()
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+
+        urls = event.mimeData().urls()
+
+        if self.single_file:
+            # Accept only a single, plain PDF file — no folders, no multi-drop.
+            paths = [url.toLocalFile() for url in urls]
+            if (
+                len(paths) == 1
+                and paths[0].lower().endswith(".pdf")
+                and os.path.isfile(paths[0])
+            ):
+                event.acceptProposedAction()
+                self._drag_count = 1
+                self._start_drag_animation()
+            else:
+                self._show_invalid_feedback()
+                event.ignore()
+        else:
             pdf_count = sum(
                 1
                 for url in urls
                 if url.toLocalFile().lower().endswith(".pdf")
                 or os.path.isdir(url.toLocalFile())
             )
-
             if pdf_count > 0:
                 event.acceptProposedAction()
                 self._drag_count = pdf_count
@@ -246,8 +275,6 @@ class FileListWidget(QListWidget):
             else:
                 self._show_invalid_feedback()
                 event.ignore()
-        else:
-            event.ignore()
 
     def dragLeaveEvent(self, event):
         self._end_drag_animation()
@@ -276,15 +303,28 @@ class FileListWidget(QListWidget):
         self._end_drag_animation()
         self._drag_count = 0
 
-        if event.mimeData().hasUrls():
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+
+        if self.single_file:
+            urls = event.mimeData().urls()
+            if len(urls) == 1:
+                path = urls[0].toLocalFile()
+                if path.lower().endswith(".pdf") and os.path.isfile(path):
+                    self.clear()
+                    self.addItem(path)
+                    event.acceptProposedAction()
+                    self.files_changed.emit()
+                    return
+            self._show_invalid_feedback()
+            event.ignore()
+        else:
             added = 0
             for url in event.mimeData().urls():
                 file_path = url.toLocalFile()
-
-                # Handle directories
                 pdfs = self._find_pdfs_recursive(file_path)
                 for pdf_path in pdfs:
-                    # Avoid duplicates
                     existing = [self.item(i).text() for i in range(self.count())]
                     if pdf_path not in existing:
                         self.addItem(pdf_path)
@@ -296,8 +336,6 @@ class FileListWidget(QListWidget):
             else:
                 self._show_invalid_feedback()
                 event.ignore()
-        else:
-            event.ignore()
 
     def get_files(self):
         return [self.item(i).text() for i in range(self.count())]
@@ -317,10 +355,194 @@ class FileListWidget(QListWidget):
             painter.setPen(QColor(100, 100, 120))
 
             rect = self.viewport().rect()
-            text = f"Drop {self.title} PDF(s) here\nor drag folders"
+            if self.single_file:
+                text = f"Drop {self.title} PDF here"
+            else:
+                text = f"Drop {self.title} PDF(s) here\nor drag folders"
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
             painter.end()
+
+
+class SourcePanelWidget(QWidget):
+    selection_changed = pyqtSignal()
+    file_browse_requested = pyqtSignal(str)  # emitted on filename-label click
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows: list[dict] = []
+        self._total_rows = 0
+        self._active_fp: str | None = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self._summary_label = QLabel("No sources loaded")
+        self._summary_label.setStyleSheet("font-size: 11px; color: #a6adc8;")
+        layout.addWidget(self._summary_label)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Filter by filename…")
+        self._search.textChanged.connect(self._apply_filter)
+        layout.addWidget(self._search)
+
+        threshold_row = QHBoxLayout()
+        threshold_row.addWidget(QLabel("Min overlap:"))
+        self._threshold = QDoubleSpinBox()
+        self._threshold.setRange(0.0, 100.0)
+        self._threshold.setSingleStep(1.0)
+        self._threshold.setSuffix(" %")
+        self._threshold.setValue(0.0)
+        self._threshold.valueChanged.connect(self._apply_filter)
+        threshold_row.addWidget(self._threshold)
+        layout.addLayout(threshold_row)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._list_container = QWidget()
+        self._list_layout = QVBoxLayout(self._list_container)
+        self._list_layout.setContentsMargins(0, 0, 0, 0)
+        self._list_layout.setSpacing(2)
+        self._list_layout.addStretch()
+        scroll.setWidget(self._list_container)
+        layout.addWidget(scroll, 1)
+
+    def populate(self, source_stats: dict, total_words: int) -> None:
+        """Build rows sorted by match count descending."""
+        while self._list_layout.count() > 1:
+            item = self._list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._rows.clear()
+
+        sorted_sources = sorted(
+            source_stats.items(), key=lambda kv: kv[1], reverse=True
+        )
+        self._total_rows = len(sorted_sources)
+
+        for fp, mc in sorted_sources:
+            pct = (mc / total_words * 100) if total_words > 0 else 0.0
+            row = self._make_row(fp, pct, mc)
+            self._rows.append(
+                {"fp": fp, "pct": pct, "chk": row["chk"], "row_widget": row["widget"]}
+            )
+            self._list_layout.insertWidget(self._list_layout.count() - 1, row["widget"])
+
+        self._apply_filter()
+
+    def _make_row(self, fp: str, pct: float, mc: int) -> dict:
+        widget = QWidget()
+        vbox = QVBoxLayout(widget)
+        vbox.setContentsMargins(4, 2, 4, 2)
+        vbox.setSpacing(1)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(4)
+
+        # Indicator-only checkbox (no text) — toggles visibility of this source
+        chk = QCheckBox()
+        chk.setChecked(True)
+        chk.setToolTip("Show/hide this source in the target view")
+        chk.setFixedWidth(18)
+        chk.stateChanged.connect(self.selection_changed)
+        top.addWidget(chk)
+
+        # Clickable filename label — single click solos this file and opens it
+        name_lbl = QLabel(os.path.basename(fp))
+        name_lbl.setStyleSheet("font-size: 11px;")
+        name_lbl.setToolTip(fp)
+        name_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        name_lbl.mousePressEvent = lambda event, _fp=fp: (
+            self._on_row_click(_fp)
+            if event.button() == Qt.MouseButton.LeftButton
+            else None
+        )
+        top.addWidget(name_lbl, 1)
+
+        stat = QLabel(f"{pct:.1f}% ({mc})")
+        stat.setStyleSheet("font-size: 10px; color: #a6adc8;")
+        top.addWidget(stat)
+        vbox.addLayout(top)
+
+        bar = QProgressBar()
+        bar.setRange(0, 1000)
+        bar.setValue(int(pct * 10))
+        bar.setTextVisible(False)
+        bar.setFixedHeight(4)
+        bar.setStyleSheet(
+            "QProgressBar { background: #313244; border-radius: 2px; }"
+            "QProgressBar::chunk { background: rgba(250,170,30,180); border-radius: 2px; }"
+        )
+        vbox.addWidget(bar)
+
+        # Use object-name selector so hover/active styles don't bleed into child widgets
+        widget.setObjectName("source_row")
+        widget.setStyleSheet(
+            "#source_row { border-radius: 4px; }"
+            "#source_row:hover { background: #313244; }"
+        )
+        return {"widget": widget, "chk": chk}
+
+    def _on_row_click(self, fp: str) -> None:
+        """Solo-select fp: check it, uncheck all others, then open in viewer."""
+        for row in self._rows:
+            row["chk"].blockSignals(True)
+            row["chk"].setChecked(row["fp"] == fp)
+            row["chk"].blockSignals(False)
+        # Emit selection change once (re-filters the target view)
+        self._apply_filter()
+        # Open the file in the reference viewer
+        self.file_browse_requested.emit(fp)
+
+    def set_active_file(self, fp: str | None) -> None:
+        """Highlight the row for the file currently shown in the reference viewer."""
+        self._active_fp = fp
+        for row in self._rows:
+            if fp is not None and row["fp"] == fp:
+                row["row_widget"].setStyleSheet(
+                    "#source_row { border-radius: 4px; background: #2d2717;"
+                    " border-left: 3px solid rgba(250,170,30,220); }"
+                    "#source_row:hover { background: #342f1a; }"
+                )
+            else:
+                row["row_widget"].setStyleSheet(
+                    "#source_row { border-radius: 4px; }"
+                    "#source_row:hover { background: #313244; }"
+                )
+
+    def _apply_filter(self) -> None:
+        search = self._search.text().lower()
+        min_pct = self._threshold.value()
+        visible = 0
+        for row in self._rows:
+            show = (
+                not search or search in os.path.basename(row["fp"]).lower()
+            ) and row["pct"] >= min_pct
+            row["row_widget"].setVisible(show)
+            if show:
+                visible += 1
+        self._summary_label.setText(f"{visible} of {self._total_rows} sources active")
+        self.selection_changed.emit()
+
+    def get_active_files(self) -> set:
+        """Return file paths that are checked AND currently visible (pass filter+threshold)."""
+        return {
+            row["fp"]
+            for row in self._rows
+            if row["chk"].isChecked() and row["row_widget"].isVisible()
+        }
+
+    def clear(self) -> None:
+        while self._list_layout.count() > 1:
+            item = self._list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._rows.clear()
+        self._total_rows = 0
+        self._summary_label.setText("No sources loaded")
 
 
 class PDFPageLabel(QLabel):
@@ -336,6 +558,9 @@ class PDFPageLabel(QLabel):
 
     matchesClicked = pyqtSignal(list)
     matchIgnored = pyqtSignal(object)
+    matchPhraseIgnored = pyqtSignal(
+        object
+    )  # emits match dict; main window writes phrase to disk
     show_hover_previews = True
 
     _popup = None
@@ -383,25 +608,24 @@ class PDFPageLabel(QLabel):
                 continue
             source = h.get("source", "")
             rect = h["rect"]
-            base_color = self.color_map.get(source, QColor(255, 0, 0, 40))
 
-            # Adjust opacity based on confidence (0.0-1.0).
-            # Keep alpha low so underlying text remains legible.
-            confidence = h.get("confidence", 0.7)
-            # Map confidence to alpha: 25 (low) to 70 (high)
-            alpha = int(25 + confidence * 45)
-            color = QColor(
-                base_color.red(), base_color.green(), base_color.blue(), alpha
-            )
+            if source in self.color_map:
+                # Source-view sentinels ("CURRENT_MATCH", "OTHER_MATCH") keep explicit color
+                base = self.color_map[source]
+                color = QColor(base.red(), base.green(), base.blue(), base.alpha())
+                confidence = h.get("confidence", 0.7)
+            else:
+                # Target-view highlights: amber, opacity = confidence
+                confidence = h.get("confidence", 0.7)
+                alpha = int(30 + confidence * 60)  # 30 (faint) … 90 (vivid)
+                color = QColor(250, 170, 30, alpha)
 
             painter.setBrush(color)
             qrect = QRectF(rect.x0, rect.y0, rect.width, rect.height)
 
             # Draw border for high-confidence matches (>80%)
             if confidence >= 0.8:
-                border_color = QColor(
-                    base_color.red(), base_color.green(), base_color.blue(), 160
-                )
+                border_color = QColor(color.red(), color.green(), color.blue(), 160)
                 pen = QPen(border_color)
                 pen.setWidth(2)
                 painter.setPen(pen)
@@ -587,6 +811,17 @@ class PDFPageLabel(QLabel):
                 lambda: self.ignore_match(match_under_cursor)
             )
             menu.addAction(ignore_action)
+
+            ignore_phrase_action = QAction("Ignore phrase globally", self)
+            ignore_phrase_action.setToolTip(
+                "Permanently exclude this phrase from all future comparisons.\n"
+                "Saved to ~/.pdfcompare/ignored_phrases.txt"
+            )
+            ignore_phrase_action.triggered.connect(
+                lambda: self.matchPhraseIgnored.emit(match_under_cursor)
+            )
+            menu.addAction(ignore_phrase_action)
+
             menu.exec(event.globalPos())
 
     def ignore_match(self, match):
@@ -610,16 +845,14 @@ class MiniMapWidget(QWidget):
         super().__init__(parent)
         self.setFixedWidth(28)
         self.matches = {}
-        self.color_map = {}
         self.total_pages = 1
         self.page_heights = []
         self.viewport_pos = 0.0
         self.viewport_height = 0.1
         self._lines_cache: QPixmap | None = None  # Pre-rendered match markers
 
-    def set_data(self, matches, color_map, total_pages, page_heights=None):
+    def set_data(self, matches, total_pages, page_heights=None):
         self.matches = matches
-        self.color_map = color_map
         self.total_pages = max(1, total_pages)
         self.page_heights = page_heights or [800.0] * self.total_pages
         self._lines_cache = None  # Invalidate on data change
@@ -676,7 +909,7 @@ class MiniMapWidget(QWidget):
                 alpha = int(40 + weight * 210)  # 40 (tiny) → 250 (large)
                 line_width = max(1, round(1 + weight * 2))  # 1 px → 3 px
 
-                color = QColor(self.color_map.get(m["source"], QColor(255, 0, 0)))
+                color = QColor(250, 170, 30)
                 color.setAlpha(alpha)
                 pen = QPen(color)
                 pen.setWidth(line_width)
