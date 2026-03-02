@@ -200,6 +200,19 @@ STOPWORDS = frozenset(
 )
 
 
+# Unicode ligature → ASCII expansion (many PDF fonts embed these)
+_LIGATURE_MAP = str.maketrans(
+    {
+        "\ufb00": "ff",
+        "\ufb01": "fi",
+        "\ufb02": "fl",
+        "\ufb03": "ffi",
+        "\ufb04": "ffl",
+        "\ufb05": "st",
+        "\ufb06": "st",
+    }
+)
+
 _INDEX_CACHE_DIR = Path.home() / ".pdfcompare" / "index_cache"
 _IGNORE_PHRASES_FILE = Path.home() / ".pdfcompare" / "ignored_phrases.txt"
 
@@ -283,8 +296,8 @@ class PDFComparator:
             pass  # non-critical
 
     def _normalize(self, text: str) -> str:
-        """Normalize text to lowercase alphanumeric characters."""
-        return "".join(c for c in text if c.isalnum()).lower()
+        """Normalize text: expand ligatures, then extract lowercase alphanumeric."""
+        return "".join(c for c in text.translate(_LIGATURE_MAP) if c.isalnum()).lower()
 
     def _extract_and_dehyphenate(self, doc) -> list:
         """
@@ -418,7 +431,15 @@ class PDFComparator:
 
     def _run_smith_waterman(self, seq1: list, seq2: list) -> tuple[list, float]:
         """
-        NumPy-optimized Smith-Waterman local alignment.
+        Vectorized Smith-Waterman local alignment.
+
+        The inner j-loop is replaced by NumPy row-by-row operations.
+        The left-gap recurrence  row[j] = max(0, row[j-1] + gap)  is solved
+        in closed form via a running-max scan (no per-column Python loop):
+
+            row[j] = max(0,  max_{k=1..j}( no_left[k-1] + k - j ))
+                   = max(0,  running_max(b)[j-1] - j )
+          where b[k] = no_left[k] + (k + 1),  k = 0 .. n-1
 
         Returns:
             Tuple of (aligned_indices, confidence_score)
@@ -429,44 +450,63 @@ class PDFComparator:
         if m == 0 or n == 0:
             return [], 0.0
 
-        # Scoring parameters
         match_score = 2
         mismatch_penalty = -1
-        gap_penalty = -1
+        gap_penalty = -1  # must be negative for the running-max trick to be valid
 
-        # Initialize score matrix with NumPy
         score_matrix = np.zeros((m + 1, n + 1), dtype=np.int32)
+        seq2_arr = np.array(seq2)  # object array — element-wise string comparison
+        # 1-indexed column positions used by the left-gap formula
+        j_idx = np.arange(1, n + 1, dtype=np.int32)
 
-        # Build scoring matrix
         max_score = 0
         max_pos = (0, 0)
 
         for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                match = match_score if seq1[i - 1] == seq2[j - 1] else mismatch_penalty
-                diag = score_matrix[i - 1, j - 1] + match
-                up = score_matrix[i - 1, j] + gap_penalty
-                left = score_matrix[i, j - 1] + gap_penalty
+            char = seq1[i - 1]
 
-                score = max(0, diag, up, left)
-                score_matrix[i, j] = score
+            # Match/mismatch vector for every column j (vectorized)
+            match_vals = np.where(
+                seq2_arr == char, match_score, mismatch_penalty
+            ).astype(np.int32)
 
-                if score > max_score:
-                    max_score = score
-                    max_pos = (i, j)
+            # Diagonal: score_matrix[i-1, 0..n-1] + match_vals
+            from_diag = score_matrix[i - 1, :n] + match_vals
+            # Up: score_matrix[i-1, 1..n] + gap_penalty
+            from_up = score_matrix[i - 1, 1:] + gap_penalty
+
+            # Best contribution ignoring the left-gap recurrence, clipped to 0
+            no_left = np.maximum(0, np.maximum(from_diag, from_up))
+
+            # Left-gap running-max trick:
+            #   b[k] = no_left[k] + (k+1)   (k is 0-indexed, j = k+1)
+            #   row[j] = max(0, running_max(b)[j-1] - j)
+            b = no_left + j_idx
+            running_max_b = np.maximum.accumulate(b)
+            left_scores = np.maximum(0, running_max_b - j_idx)
+
+            row = np.maximum(no_left, left_scores)
+            score_matrix[i, 1:] = row
+
+            # Track global maximum
+            row_max_idx = int(np.argmax(row))
+            row_max = int(row[row_max_idx])
+            if row_max > max_score:
+                max_score = row_max
+                max_pos = (i, row_max_idx + 1)  # convert to 1-indexed column
 
         if max_score == 0:
             return [], 0.0
 
-        # Traceback
+        # Traceback — O(m+n), too short to worth vectorizing
         align_indices = []
         i, j = max_pos
         match_count = 0
         total_aligned = 0
 
         while i > 0 and j > 0 and score_matrix[i, j] > 0:
-            score = score_matrix[i, j]
-            score_diag = score_matrix[i - 1, j - 1]
+            score = int(score_matrix[i, j])
+            score_diag = int(score_matrix[i - 1, j - 1])
             is_match = seq1[i - 1] == seq2[j - 1]
             match = match_score if is_match else mismatch_penalty
 
@@ -476,30 +516,19 @@ class PDFComparator:
                     align_indices.append(i - 1)
                     match_count += 1
                 i, j = i - 1, j - 1
-            elif score == score_matrix[i - 1, j] + gap_penalty:
+            elif score == int(score_matrix[i - 1, j]) + gap_penalty:
                 i -= 1
             else:
                 j -= 1
 
-        # Calculate confidence score based on:
-        # 1. Match ratio within alignment (identity)
-        # 2. Coverage of the shorter sequence
-        # 3. Alignment score relative to perfect alignment
-
         identity = match_count / max(1, total_aligned)
-
         min_len = min(m, n)
         coverage = len(align_indices) / max(1, min_len)
-
-        # Perfect score would be min_len * match_score
         perfect_score = min_len * match_score
         normalized_score = max_score / max(1, perfect_score)
-
-        # Weighted combination: identity most important, then coverage, then raw score
         confidence = (
             (identity * 0.5) + (coverage * 0.3) + (min(1.0, normalized_score) * 0.2)
         )
-
         return sorted(align_indices), min(1.0, confidence)
 
     def _match_gram_chunk(self, gram_chunk: list, mode: str) -> list:
@@ -663,8 +692,12 @@ class PDFComparator:
             progress_callback(60, "Refining matches...")
 
         # Process blocks and apply Smith-Waterman if enabled
-        final_highlights = defaultdict(list)
+        # best_match_per_word keeps the highest-confidence hit for each target word
+        # index so that overlapping matches from multiple sources don't stack
+        # visually on the same pixel.  source_word_counts is still accumulated
+        # for all sources (for the statistics panel) regardless of display dedup.
         source_word_counts = defaultdict(set)
+        best_match_per_word: dict[int, dict] = {}
 
         ignored_phrases = load_ignored_phrases()
 
@@ -729,18 +762,18 @@ class PDFComparator:
 
             for i in indices:
                 if i < len(filtered_target):
-                    for p, r, w in filtered_target[i][2]:
-                        final_highlights[p].append(
-                            {
-                                "rect": r,
-                                "word": w.strip(".,;:!?\"'()[]{}«»–—"),
-                                "source": block["src"],
-                                "source_data": source_info,
-                                "match_id": match_id,
-                                "confidence": confidence,
-                            }
-                        )
-                        source_word_counts[block["src"]].add(i)
+                    # Statistics: every source keeps its own count (no dedup)
+                    source_word_counts[block["src"]].add(i)
+                    # Display: keep only the highest-confidence match per word
+                    if confidence > best_match_per_word.get(i, {}).get(
+                        "confidence", -1.0
+                    ):
+                        best_match_per_word[i] = {
+                            "source": block["src"],
+                            "source_info": source_info,
+                            "match_id": match_id,
+                            "confidence": confidence,
+                        }
 
             if progress_callback and total_blocks > 0:
                 percent = 60 + int((block_idx / total_blocks) * 35)
@@ -748,12 +781,27 @@ class PDFComparator:
                     percent, f"Processing block {block_idx + 1}/{total_blocks}"
                 )
 
+        # Build final highlight list — one rect per target word (no alpha stacking)
+        final_highlights: dict = defaultdict(list)
+        for i, best in best_match_per_word.items():
+            for p, r, w in filtered_target[i][2]:
+                final_highlights[p].append(
+                    {
+                        "rect": r,
+                        "word": w.strip(".,;:!?\"'()[]{}«»–—"),
+                        "source": best["source"],
+                        "source_data": best["source_info"],
+                        "match_id": best["match_id"],
+                        "confidence": best["confidence"],
+                    }
+                )
+
         if progress_callback:
             progress_callback(100, "Complete")
 
         return (
             final_highlights,
-            len(merged_target),
+            len(filtered_target),  # content words only (stopwords excluded)
             {src: len(idxs) for src, idxs in source_word_counts.items()},
         )
 
