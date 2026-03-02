@@ -131,6 +131,11 @@ class MainWindow(QMainWindow):
         self.current_match_index = 0
         self.widget_pool = []  # Pool for PDFPageLabel reuse
 
+        # Reference-viewer navigation: sorted list of reference page indices that
+        # have highlight marks; _source_match_page_idx is the current position.
+        self._source_match_pages: list = []
+        self._source_match_page_idx: int = 0
+
         # Virtual scroll state — target view
         self._page_slots: list = []
         self._page_slot_data: list = []
@@ -1258,6 +1263,8 @@ class MainWindow(QMainWindow):
         self.current_target_file = None
         self.current_match_list = []
         self.current_match_index = 0
+        self._source_match_pages = []
+        self._source_match_page_idx = 0
         self.ignored_match_ids = set()
         self.last_rendered_source = None
         self.last_rendered_zoom = None
@@ -1414,84 +1421,93 @@ class MainWindow(QMainWindow):
                     self.current_match_list = []
 
     def handle_matches_clicked(self, matches):
-        # Check if we clicked the same set of matches (overlapping area)
         current_ids = [m.get("match_id") for m in matches]
         last_ids = (
             [m.get("match_id") for m in self.current_match_list]
             if self.current_match_list
             else []
         )
-
         if current_ids == last_ids:
-            # Same spot clicked, cycle next
+            # Same spot re-clicked: advance to the next highlighted page in the
+            # reference viewer (cycles through all matches from that source file).
             self.next_match()
         else:
-            # New spot, reset
             self.current_match_list = matches
             self.current_match_index = 0
-            self.update_match_controls()
             self.load_current_match()
 
     def update_match_controls(self):
-        c = len(self.current_match_list)
-        if c > 1:
+        """Show/hide ◀▶ navigation based on how many reference pages are highlighted."""
+        n = len(self._source_match_pages)
+        if n > 1:
             self.btn_prev_match.setVisible(True)
             self.btn_next_match.setVisible(True)
             self.lbl_match_counter.setVisible(True)
             self.lbl_match_counter.setText(
-                f"Match {self.current_match_index + 1} of {c}"
+                f"Match {self._source_match_page_idx + 1} of {n}"
             )
         else:
             self.btn_prev_match.setVisible(False)
             self.btn_next_match.setVisible(False)
             self.lbl_match_counter.setVisible(False)
 
+    def _scroll_to_source_match(self):
+        """Scroll the reference viewer to _source_match_pages[_source_match_page_idx]."""
+        if not self._source_match_pages or not self._source_page_slots:
+            return
+        page_idx = self._source_match_pages[self._source_match_page_idx]
+        if page_idx < len(self._source_page_slots):
+            widget = self._source_page_slots[page_idx]
+            self.source_scroll.ensureWidgetVisible(widget)
+        n = len(self._source_match_pages)
+        self.status_bar.showMessage(
+            f"Reference match {self._source_match_page_idx + 1} of {n}", 3000
+        )
+
     def prev_match(self):
-        if self.current_match_list:
-            self.current_match_index = (self.current_match_index - 1) % len(
-                self.current_match_list
-            )
-            self.update_match_controls()
-            self.load_current_match()
+        if not self._source_match_pages:
+            return
+        self._source_match_page_idx = (self._source_match_page_idx - 1) % len(
+            self._source_match_pages
+        )
+        self._scroll_to_source_match()
+        self.update_match_controls()
 
     def next_match(self):
-        if self.current_match_list:
-            self.current_match_index = (self.current_match_index + 1) % len(
-                self.current_match_list
-            )
-            self.update_match_controls()
-            self.load_current_match()
+        if not self._source_match_pages:
+            return
+        self._source_match_page_idx = (self._source_match_page_idx + 1) % len(
+            self._source_match_pages
+        )
+        self._scroll_to_source_match()
+        self.update_match_controls()
 
     def load_current_match(self):
         if self.current_match_list:
             current_match = self.current_match_list[self.current_match_index]
-            # Pass all matches for this source file, plus the current match index
             self.load_source_view(
                 current_match["source"],
                 current_match["source_data"],
-                all_matches=self.current_match_list,
-                current_match_idx=self.current_match_index,
             )
 
     def _browse_reference_pdf(self, file_path: str) -> None:
         """Open a reference PDF in the viewer without jumping to a specific match."""
+        self.current_match_list = []
+        self.current_match_index = 0
         self.load_source_view(file_path, source_data=[])
 
-    def load_source_view(
-        self,
-        file_path,
-        source_data,
-        all_matches=None,
-        current_match_idx=0,
-    ):
+    def load_source_view(self, file_path, source_data):
         """
         Load and display a reference document with match highlighting.
 
+        Highlights ALL matches from this source file (from current_results) so the
+        user can cycle through them with repeated clicks or the ◀▶ buttons.
+        The specific match given by source_data is shown in gold; all others amber.
+
         Args:
-            file_path: Path to the source PDF
-            source_data: Match location data for the current match
-            all_matches: Optional list of all matches to show (for multi-match view)
-            current_match_idx: Index of the current/active match in all_matches
+            file_path:   Path to the source PDF
+            source_data: (page, rect, word) triples for the currently-active match
+                         (empty list when browsing without a specific match)
         """
         tp = source_data[0][0] if source_data else None
         name = os.path.basename(file_path)
@@ -1616,28 +1632,60 @@ class MainWindow(QMainWindow):
         current_color = QColor(255, 180, 50, 110)  # gold
         other_color = QColor(250, 170, 30, 40)  # amber-muted
 
-        # Collect all source_data from all matches for this file
-        all_highlights_by_page = {}  # {page_idx: [(rect, is_current), ...]}
+        # Keys identifying which reference rects belong to the actively-clicked match
+        current_rect_keys: set = set()
+        for ref_page, ref_rect, _ in source_data:
+            current_rect_keys.add(
+                (ref_page, ref_rect.x0, ref_rect.y0, ref_rect.x1, ref_rect.y1)
+            )
 
-        if all_matches:
-            for match_idx, match in enumerate(all_matches):
-                # Only process matches from the same source file
-                if match.get("source") != file_path:
+        # Scan the COMPLETE results to collect every match from this source file.
+        # This ensures all reference locations are visible and navigable, not just
+        # the one that was clicked.
+        all_highlights_by_page: dict = {}
+        seen_rect_keys: set = set()
+        for page_highlights in self.current_results.values():
+            for h in page_highlights:
+                if h.get("source") != file_path or h.get("ignored", False):
                     continue
+                for ref_page, ref_rect, _ in h.get("source_data", []):
+                    rkey = (
+                        ref_page,
+                        ref_rect.x0,
+                        ref_rect.y0,
+                        ref_rect.x1,
+                        ref_rect.y1,
+                    )
+                    if rkey in seen_rect_keys:
+                        continue
+                    seen_rect_keys.add(rkey)
+                    is_current = rkey in current_rect_keys
+                    if ref_page not in all_highlights_by_page:
+                        all_highlights_by_page[ref_page] = []
+                    all_highlights_by_page[ref_page].append((ref_rect, is_current))
 
-                match_source_data = match.get("source_data", [])
-                is_current = match_idx == current_match_idx
+        # Fallback when there are no comparison results yet (e.g., browse mode
+        # before a comparison has been run).
+        if not all_highlights_by_page:
+            for ref_page, ref_rect, _ in source_data:
+                if ref_page not in all_highlights_by_page:
+                    all_highlights_by_page[ref_page] = []
+                all_highlights_by_page[ref_page].append((ref_rect, True))
 
-                for page_idx, rect, word in match_source_data:
-                    if page_idx not in all_highlights_by_page:
-                        all_highlights_by_page[page_idx] = []
-                    all_highlights_by_page[page_idx].append((rect, is_current))
+        # Build the reference-navigation index (sorted page list + initial position)
+        self._source_match_pages = sorted(all_highlights_by_page.keys())
+        if tp is not None and tp in self._source_match_pages:
+            self._source_match_page_idx = self._source_match_pages.index(tp)
         else:
-            # Fallback: just use the current source_data
-            for page_idx, rect, word in source_data:
-                if page_idx not in all_highlights_by_page:
-                    all_highlights_by_page[page_idx] = []
-                all_highlights_by_page[page_idx].append((rect, True))
+            self._source_match_page_idx = 0
+
+        # When opened without a specific match (browse mode), scroll to first
+        # highlighted page instead of the top of the document.
+        scroll_page = (
+            tp
+            if tp is not None
+            else (self._source_match_pages[0] if self._source_match_pages else None)
+        )
 
         def _merge_rects(rects):
             if not rects:
@@ -1701,7 +1749,7 @@ class MainWindow(QMainWindow):
             if self._source_page_slot_data[slot_idx]["materialized"]:
                 lbl.draw_highlights()
 
-            if p_idx == tp:
+            if p_idx == scroll_page:
                 target_widget = lbl
 
         # Materialize visible source pages (first load or after highlight refresh)
@@ -1735,15 +1783,19 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(
                 50, lambda: self.source_scroll.ensureWidgetVisible(target_widget)
             )
-            hdr_to_find = f"--- Page {tp + 1} ---"
-            cursor = doc_obj.find(hdr_to_find)
-            if not cursor.isNull():
-                QTimer.singleShot(
-                    50, lambda: self.source_text_edit.setTextCursor(cursor)
-                )
-                QTimer.singleShot(
-                    50, lambda: self.source_text_edit.ensureCursorVisible()
-                )
+            if scroll_page is not None:
+                hdr_to_find = f"--- Page {scroll_page + 1} ---"
+                cursor = doc_obj.find(hdr_to_find)
+                if not cursor.isNull():
+                    QTimer.singleShot(
+                        50, lambda: self.source_text_edit.setTextCursor(cursor)
+                    )
+                    QTimer.singleShot(
+                        50, lambda: self.source_text_edit.ensureCursorVisible()
+                    )
+
+        # Show/hide ◀▶ navigation buttons based on number of highlighted pages
+        self.update_match_controls()
 
     def keyPressEvent(self, event):
         """Global keyboard shortcuts."""
