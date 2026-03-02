@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QComboBox,
     QApplication,
+    QSlider,
 )
 from PyQt6.QtGui import QColor, QPalette, QPixmap
 from PyQt6.QtCore import Qt, QThread, QTimer, QThreadPool
@@ -662,6 +663,25 @@ class MainWindow(QMainWindow):
 
         h_right_head.addStretch()
 
+        # Highlight intensity slider (25 % – 200 %, default 100 %)
+        lbl_intensity = QLabel("Intensity:")
+        lbl_intensity.setStyleSheet("font-size: 11px;")
+        h_right_head.addWidget(lbl_intensity)
+        self.slider_intensity = QSlider(Qt.Orientation.Horizontal)
+        self.slider_intensity.setRange(25, 200)
+        self.slider_intensity.setValue(100)
+        self.slider_intensity.setFixedWidth(80)
+        self.slider_intensity.setToolTip(
+            "Adjust highlight opacity (25 % – 200 %).\n"
+            "Drag left for subtler highlights, right for more vivid."
+        )
+        self.slider_intensity.valueChanged.connect(self.on_hl_intensity_changed)
+        h_right_head.addWidget(self.slider_intensity)
+        self.lbl_intensity_val = QLabel("100%")
+        self.lbl_intensity_val.setStyleSheet("font-size: 11px; min-width: 34px;")
+        h_right_head.addWidget(self.lbl_intensity_val)
+        h_right_head.addSpacing(6)
+
         btn_zoom_in_t = QPushButton("+")
         btn_zoom_in_t.setFixedSize(28, 28)
         btn_zoom_in_t.setStyleSheet("font-size: 16px; font-weight: bold; padding: 0px;")
@@ -725,6 +745,15 @@ class MainWindow(QMainWindow):
         self.mini_map.setVisible(visible)
         if visible:
             self.update_mini_map_viewport()
+
+    def on_hl_intensity_changed(self, value: int) -> None:
+        """Update global highlight intensity and redraw the target view."""
+        PDFPageLabel.hl_intensity = value / 100.0
+        self.lbl_intensity_val.setText(f"{value}%")
+        # Invalidate all cached highlight renders so they pick up the new alpha
+        for lbl in self._page_slots:
+            lbl._hl_cache_key = None
+            lbl.draw_highlights()
 
     def toggle_source_view(self):
         self.source_stack.setCurrentIndex(1 if self.btn_toggle_view.isChecked() else 0)

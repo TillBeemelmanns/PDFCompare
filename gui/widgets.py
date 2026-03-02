@@ -562,6 +562,7 @@ class PDFPageLabel(QLabel):
         object
     )  # emits match dict; main window writes phrase to disk
     show_hover_previews = True
+    hl_intensity: float = 1.0  # Global multiplier for highlight alpha (0.25 – 2.0)
 
     _popup = None
     _pending_preview_worker = None  # Track current preview worker for cancellation
@@ -592,9 +593,13 @@ class PDFPageLabel(QLabel):
             self._hl_cache_key = None
             return
 
-        # Return cached result when neither the highlight list nor the base
-        # pixmap object has changed since the last paint.
-        cache_key = (id(self.highlights), id(self.original_pixmap))
+        # Return cached result when neither the highlight list, the base pixmap,
+        # nor the global intensity multiplier has changed since the last paint.
+        cache_key = (
+            id(self.highlights),
+            id(self.original_pixmap),
+            PDFPageLabel.hl_intensity,
+        )
         if cache_key == self._hl_cache_key and self._hl_cache is not None:
             self.setPixmap(self._hl_cache)
             return
@@ -615,9 +620,11 @@ class PDFPageLabel(QLabel):
                 color = QColor(base.red(), base.green(), base.blue(), base.alpha())
                 confidence = h.get("confidence", 0.7)
             else:
-                # Target-view highlights: amber, opacity = confidence
+                # Target-view highlights: amber, opacity = confidence × global intensity
                 confidence = h.get("confidence", 0.7)
-                alpha = int(30 + confidence * 60)  # 30 (faint) … 90 (vivid)
+                alpha = int(
+                    min(255, (30 + confidence * 60) * PDFPageLabel.hl_intensity)
+                )
                 color = QColor(250, 170, 30, alpha)
 
             painter.setBrush(color)

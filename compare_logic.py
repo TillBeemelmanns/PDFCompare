@@ -582,6 +582,75 @@ class PDFComparator:
 
         return matches
 
+    def _process_single_block(
+        self,
+        block: dict,
+        filtered_target: list,
+        use_sw: bool,
+        sw_expansion: int,
+        ignored_phrases: frozenset,
+    ) -> Optional[tuple]:
+        """Align one merged block and return its contribution, or None if skipped.
+
+        Called from a thread pool — reads only immutable shared state
+        (filtered_target, self.reference_maps) so no locking is needed.
+
+        Returns:
+            (source, valid_indices, confidence, source_info, match_id)  or  None
+        """
+        if block["end"] - block["start"] < 3:
+            return None
+
+        indices = range(block["start"], block["end"])
+        s_start = block["src_start_idx"]
+        s_end = block["src_start_idx"] + (block["end"] - block["start"])
+        confidence = 0.7
+
+        if use_sw:
+            exp = sw_expansion
+            t_s = max(0, block["start"] - exp)
+            t_e = min(len(filtered_target), block["end"] + exp)
+            src_len = block["end"] - block["start"]
+            s_s_win = max(0, block["src_start_idx"] - exp)
+            s_map = self.reference_maps.get(block["src"], [])
+            s_e_win = min(len(s_map), block["src_start_idx"] + src_len + exp)
+
+            aligned, sw_confidence = self._run_smith_waterman(
+                [filtered_target[i][1] for i in range(t_s, t_e)],
+                [s_map[i][1] for i in range(s_s_win, s_e_win)],
+            )
+            aligned_g = [t_s + i for i in aligned]
+
+            if len(aligned_g) > (block["end"] - block["start"]) * 0.5:
+                indices = aligned_g
+                s_start, s_end = s_s_win, s_e_win
+                confidence = sw_confidence
+        else:
+            block_len = block["end"] - block["start"]
+            confidence = min(1.0, 0.5 + (block_len / 20.0) * 0.5)
+
+        if ignored_phrases:
+            block_text = " ".join(
+                w.strip(".,;:!?\"'()[]{}«»–—").lower()
+                for i in indices
+                if i < len(filtered_target)
+                for _, _, w in filtered_target[i][2]
+            )
+            if any(phrase in block_text for phrase in ignored_phrases):
+                return None
+
+        source_info = []
+        if block["src"] in self.reference_maps:
+            s_map = self.reference_maps[block["src"]]
+            s_start = max(0, min(s_start, len(s_map)))
+            s_end = max(0, min(s_end, len(s_map)))
+            for parts, _ in s_map[s_start:s_end]:
+                for p, r, w in parts:
+                    source_info.append((p, r, w))
+
+        valid_indices = [i for i in indices if i < len(filtered_target)]
+        return (block["src"], valid_indices, confidence, source_info, id(block))
+
     def compare_document(
         self,
         target_path: str,
@@ -606,14 +675,38 @@ class PDFComparator:
         if progress_callback:
             progress_callback(0, "Extracting text...")
 
-        doc = fitz.open(target_path)
-        merged_target = self._extract_and_dehyphenate(doc)
-        doc.close()
+        # Re-use the same incremental cache that backs reference indexing.
+        # The key is MD5(path + mtime + size), so the cache is auto-invalidated
+        # whenever the file changes — no manual management needed.
+        filtered_raw = self._load_index_cache(target_path)
+        if filtered_raw is not None:
+            filtered_target = [
+                (
+                    i,
+                    norm,
+                    [
+                        (p, fitz.Rect(x0, y0, x1, y1), w)
+                        for p, (x0, y0, x1, y1), w in parts_raw
+                    ],
+                )
+                for i, norm, parts_raw in filtered_raw
+            ]
+        else:
+            doc = fitz.open(target_path)
+            merged = self._extract_and_dehyphenate(doc)
+            doc.close()
+            if not merged:
+                return {}, 0, {}
+            filtered_target = list(self._filter_words_merged(merged))
+            # Serialise fitz.Rect → tuple for pickle portability (same as ref cache)
+            filtered_raw = [
+                (i, norm, [(p, (r.x0, r.y0, r.x1, r.y1), w) for p, r, w in parts])
+                for i, norm, parts in filtered_target
+            ]
+            self._save_index_cache(target_path, filtered_raw)
 
-        if not merged_target:
+        if not filtered_target:
             return {}, 0, {}
-
-        filtered_target = list(self._filter_words_merged(merged_target))
 
         if progress_callback:
             progress_callback(10, "Matching n-grams...")
@@ -691,95 +784,52 @@ class PDFComparator:
         if progress_callback:
             progress_callback(60, "Refining matches...")
 
-        # Process blocks and apply Smith-Waterman if enabled
-        # best_match_per_word keeps the highest-confidence hit for each target word
-        # index so that overlapping matches from multiple sources don't stack
-        # visually on the same pixel.  source_word_counts is still accumulated
-        # for all sources (for the statistics panel) regardless of display dedup.
+        # Process blocks in parallel — each call is CPU-bound (NumPy SW) and reads
+        # only immutable state, so Python threads release the GIL during the heavy
+        # array work and achieve genuine concurrency.
         source_word_counts = defaultdict(set)
         best_match_per_word: dict[int, dict] = {}
 
         ignored_phrases = load_ignored_phrases()
-
         total_blocks = len(merged_blocks)
-        for block_idx, block in enumerate(merged_blocks):
-            if block["end"] - block["start"] < 3:
-                continue
+        completed = 0
 
-            indices = range(block["start"], block["end"])
-            s_start = block["src_start_idx"]
-            s_end = block["src_start_idx"] + (block["end"] - block["start"])
-            confidence = 0.7  # Default confidence for non-SW matches
-
-            if use_sw:
-                exp = sw_expansion
-                t_s = max(0, block["start"] - exp)
-                t_e = min(len(filtered_target), block["end"] + exp)
-                src_len = block["end"] - block["start"]
-                s_s_win = max(0, block["src_start_idx"] - exp)
-                s_map = self.reference_maps.get(block["src"], [])
-                s_e_win = min(len(s_map), block["src_start_idx"] + src_len + exp)
-
-                aligned, sw_confidence = self._run_smith_waterman(
-                    [filtered_target[i][1] for i in range(t_s, t_e)],
-                    [s_map[i][1] for i in range(s_s_win, s_e_win)],
-                )
-                aligned_g = [t_s + i for i in aligned]
-
-                if len(aligned_g) > (block["end"] - block["start"]) * 0.5:
-                    indices = aligned_g
-                    s_start, s_end = s_s_win, s_e_win
-                    confidence = sw_confidence
-            else:
-                # For non-SW matches, calculate confidence based on n-gram coverage
-                block_len = block["end"] - block["start"]
-                confidence = min(1.0, 0.5 + (block_len / 20.0) * 0.5)
-
-            # Skip blocks whose final aligned text matches a globally ignored phrase.
-            # This check is done AFTER Smith-Waterman so `indices` contains the full
-            # matched word set (seed_size alone is often too short to match the phrase).
-            if ignored_phrases:
-                block_text = " ".join(
-                    w.strip(".,;:!?\"'()[]{}«»–—").lower()
-                    for i in indices
-                    if i < len(filtered_target)
-                    for _, _, w in filtered_target[i][2]
-                )
-                if any(phrase in block_text for phrase in ignored_phrases):
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {
+                executor.submit(
+                    self._process_single_block,
+                    block,
+                    filtered_target,
+                    use_sw,
+                    sw_expansion,
+                    ignored_phrases,
+                ): block
+                for block in merged_blocks
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                completed += 1
+                if progress_callback and total_blocks > 0:
+                    percent = 60 + int((completed / total_blocks) * 35)
+                    progress_callback(
+                        percent, f"Processing block {completed}/{total_blocks}"
+                    )
+                if result is None:
                     continue
-
-            # Build source info
-            source_info = []
-            if block["src"] in self.reference_maps:
-                s_map = self.reference_maps[block["src"]]
-                s_start = max(0, min(s_start, len(s_map)))
-                s_end = max(0, min(s_end, len(s_map)))
-                for parts, _ in s_map[s_start:s_end]:
-                    for p, r, w in parts:
-                        source_info.append((p, r, w))
-
-            match_id = id(block)
-
-            for i in indices:
-                if i < len(filtered_target):
+                src, valid_indices, confidence, source_info, match_id = result
+                for i in valid_indices:
                     # Statistics: every source keeps its own count (no dedup)
-                    source_word_counts[block["src"]].add(i)
+                    source_word_counts[src].add(i)
                     # Display: keep only the highest-confidence match per word
                     if confidence > best_match_per_word.get(i, {}).get(
                         "confidence", -1.0
                     ):
                         best_match_per_word[i] = {
-                            "source": block["src"],
+                            "source": src,
                             "source_info": source_info,
                             "match_id": match_id,
                             "confidence": confidence,
                         }
-
-            if progress_callback and total_blocks > 0:
-                percent = 60 + int((block_idx / total_blocks) * 35)
-                progress_callback(
-                    percent, f"Processing block {block_idx + 1}/{total_blocks}"
-                )
 
         # Build final highlight list — one rect per target word (no alpha stacking)
         final_highlights: dict = defaultdict(list)
