@@ -18,6 +18,8 @@ import numpy as np
 
 import Levenshtein
 
+from models import HighlightEntry
+
 
 # Class-level constant for memory efficiency
 STOPWORDS = frozenset(
@@ -856,15 +858,15 @@ class PDFComparator:
         for i, best in best_match_per_word.items():
             for p, r, w in filtered_target[i][2]:
                 final_highlights[p].append(
-                    {
-                        "rect": r,
-                        "word": w.strip(".,;:!?\"'()[]{}«»–—"),
-                        "source": best["source"],
-                        "source_data": best["source_info"],
-                        "match_id": best["match_id"],
-                        "confidence": best["confidence"],
-                        "match_density": best.get("match_density", 0.0),
-                    }
+                    HighlightEntry(
+                        rect=r,
+                        word=w.strip(".,;:!?\"'()[]{}«»–—"),
+                        source=best["source"],
+                        source_data=best["source_info"],
+                        match_id=best["match_id"],
+                        confidence=best["confidence"],
+                        match_density=best.get("match_density", 0.0),
+                    )
                 )
 
         if progress_callback:

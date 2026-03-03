@@ -611,11 +611,11 @@ class PDFPageLabel(QLabel):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         for h in self.highlights:
-            if h.get("ignored", False):
+            if h.ignored:
                 continue
-            source = h.get("source", "")
-            rect = h["rect"]
-            confidence = h.get("confidence", 0.7)
+            source = h.source
+            rect = h.rect
+            confidence = h.confidence
 
             if source in self.color_map:
                 # Source-view sentinels ("CURRENT_MATCH", "OTHER_MATCH") keep explicit color
@@ -668,16 +668,16 @@ class PDFPageLabel(QLabel):
         # Find ALL matches here
         matches_here = []
         for h in self.highlights:
-            if h.get("ignored", False):
+            if h.ignored:
                 continue
-            r = h["rect"]
+            r = h.rect
             if (r.x0 <= x <= r.x1) and (r.y0 <= y <= r.y1):
                 matches_here.append(h)
 
         if matches_here:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
             self.setFocus()  # Grab focus for key events
-            mids = [m.get("match_id") for m in matches_here]
+            mids = [m.match_id for m in matches_here]
 
             if self.show_hover_previews:
                 if mids != self.current_match_ids:
@@ -748,7 +748,7 @@ class PDFPageLabel(QLabel):
         self._popup.set_loading()
 
         # Track which match_ids we're requesting
-        match_ids = [m.get("match_id") for m in matches]
+        match_ids = [m.match_id for m in matches]
         self._preview_request_ids = match_ids
 
         # Create worker
@@ -785,11 +785,11 @@ class PDFPageLabel(QLabel):
             x, y = pos.x(), pos.y()
             clicked = []
             for h in self.highlights:
-                if h.get("ignored", False):
+                if h.ignored:
                     continue
-                r = h["rect"]
+                r = h.rect
                 if (r.x0 <= x <= r.x1) and (r.y0 <= y <= r.y1):
-                    if "source_data" in h and h["source_data"]:
+                    if h.source_data:
                         clicked.append(h)
             if clicked:
                 self.matchesClicked.emit(clicked)
@@ -800,9 +800,9 @@ class PDFPageLabel(QLabel):
         x, y = pos.x(), pos.y()
         match_under_cursor = None
         for h in self.highlights:
-            if h.get("ignored", False):
+            if h.ignored:
                 continue
-            r = h["rect"]
+            r = h.rect
             if (r.x0 <= x <= r.x1) and (r.y0 <= y <= r.y1):
                 match_under_cursor = h
                 break
@@ -843,7 +843,7 @@ class PDFPageLabel(QLabel):
             menu.exec(event.globalPos())
 
     def ignore_match(self, match):
-        match["ignored"] = True
+        match.ignored = True
         self._hl_cache_key = None  # List mutated in-place — force a full repaint
         self.draw_highlights()
         self.matchIgnored.emit(match)
@@ -917,16 +917,16 @@ class MiniMapWidget(QWidget):
                 continue
             page_base_y = y_offsets[page_idx]
             for m in matches:
-                if m.get("ignored", False):
+                if m.ignored:
                     continue
-                confidence = m.get("confidence", 0.7)
+                confidence = m.confidence
                 if confidence < self.min_confidence:
                     continue
-                r = m["rect"]
+                r = m.rect
                 y_pixel = int(((page_base_y + r.y0) / total_doc_height) * h)
 
                 # Weight by word count: small matches fade into the background
-                word_count = len(m.get("source_data", []))
+                word_count = len(m.source_data or [])
                 weight = min(1.0, word_count / _MAX_REF_WORDS)
                 alpha = int(40 + weight * 210)  # 40 (tiny) → 250 (large)
                 line_width = max(1, round(1 + weight * 2))  # 1 px → 3 px

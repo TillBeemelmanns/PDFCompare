@@ -40,6 +40,7 @@ from compare_logic import (
     _IGNORE_PHRASES_FILE,
     _normalize_ignore_phrase,
 )
+from models import HighlightEntry
 from gui.widgets import FileListWidget, PDFPageLabel, MiniMapWidget, SourcePanelWidget
 from gui.workers import CompareWorker, IndexWorker, PageRenderWorker
 from gui.pdf_renderer import PDFRenderer
@@ -565,9 +566,11 @@ class MainWindow(QMainWindow):
         row_s1.addWidget(self.lbl_stats_mem)
         row_s2 = QHBoxLayout()
         row_s2.addWidget(self.lbl_stats_cache)
-        row_s2.addWidget(self.lbl_stats_matches)
+        row_s3 = QHBoxLayout()
+        row_s3.addWidget(self.lbl_stats_matches)
         stats_col.addLayout(row_s1)
         stats_col.addLayout(row_s2)
+        stats_col.addLayout(row_s3)
         gb_stats.setLayout(stats_col)
         left_layout.addWidget(gb_stats)
 
@@ -813,8 +816,8 @@ class MainWindow(QMainWindow):
             fm = [
                 m
                 for m in matches
-                if m["source"] in active_files
-                and m["match_id"] not in self.ignored_match_ids
+                if m.source in active_files
+                and m.match_id not in self.ignored_match_ids
             ]
             if fm:
                 filtered[p_idx] = fm
@@ -1015,19 +1018,19 @@ class MainWindow(QMainWindow):
             if page_idx in results:
                 for m in results[page_idx]:
                     highlights.append(
-                        {
-                            "rect": fitz.Rect(
-                                m["rect"].x0 * zoom,
-                                m["rect"].y0 * zoom,
-                                m["rect"].x1 * zoom,
-                                m["rect"].y1 * zoom,
+                        HighlightEntry(
+                            rect=fitz.Rect(
+                                m.rect.x0 * zoom,
+                                m.rect.y0 * zoom,
+                                m.rect.x1 * zoom,
+                                m.rect.y1 * zoom,
                             ),
-                            "source": m["source"],
-                            "source_data": m["source_data"],
-                            "match_id": m.get("match_id"),
-                            "confidence": m.get("confidence", 0.7),
-                            "match_density": m.get("match_density", 0.0),
-                        }
+                            source=m.source,
+                            source_data=m.source_data,
+                            match_id=m.match_id,
+                            confidence=m.confidence,
+                            match_density=m.match_density,
+                        )
                     )
 
             w_px, h_px = self._target_page_dims[page_idx]
@@ -1418,7 +1421,7 @@ class MainWindow(QMainWindow):
     def handle_phrase_ignored(self, match):
         """Persist the matched phrase to disk and immediately hide every block
         whose text contains the same phrase — not just the one right-clicked."""
-        match_id = match.get("match_id")
+        match_id = match.match_id
         if not match_id:
             return
 
@@ -1426,8 +1429,8 @@ class MainWindow(QMainWindow):
         phrase_words = []
         for page_idx in sorted(self.current_results):
             for h in self.current_results[page_idx]:
-                if h.get("match_id") == match_id:
-                    phrase_words.append(h.get("word", ""))
+                if h.match_id == match_id:
+                    phrase_words.append(h.word)
 
         phrase = " ".join(phrase_words).strip().lower()
         if not phrase:
@@ -1442,9 +1445,9 @@ class MainWindow(QMainWindow):
         match_words: dict = {}
         for page_idx in sorted(self.current_results):
             for h in self.current_results[page_idx]:
-                mid = h.get("match_id")
+                mid = h.match_id
                 if mid is not None:
-                    match_words.setdefault(mid, []).append(h.get("word", ""))
+                    match_words.setdefault(mid, []).append(h.word)
 
         newly_ignored = 0
         for mid, words in match_words.items():
@@ -1466,7 +1469,7 @@ class MainWindow(QMainWindow):
         self.refresh_target_view()
 
     def handle_match_ignored(self, match):
-        mid = match.get("match_id")
+        mid = match.match_id
         if mid:
             self.ignored_match_ids.add(mid)
             self.status_bar.showMessage("Match block ignored.", 3000)
@@ -1474,7 +1477,7 @@ class MainWindow(QMainWindow):
 
             if self.current_match_list:
                 if (
-                    self.current_match_list[self.current_match_index].get("match_id")
+                    self.current_match_list[self.current_match_index].match_id
                     == mid
                 ):
                     # Clear source view
@@ -1486,9 +1489,9 @@ class MainWindow(QMainWindow):
                     self.current_match_list = []
 
     def handle_matches_clicked(self, matches):
-        current_ids = [m.get("match_id") for m in matches]
+        current_ids = [m.match_id for m in matches]
         last_ids = (
-            [m.get("match_id") for m in self.current_match_list]
+            [m.match_id for m in self.current_match_list]
             if self.current_match_list
             else []
         )
@@ -1551,8 +1554,8 @@ class MainWindow(QMainWindow):
         if self.current_match_list:
             current_match = self.current_match_list[self.current_match_index]
             self.load_source_view(
-                current_match["source"],
-                current_match["source_data"],
+                current_match.source,
+                current_match.source_data,
             )
 
     def _browse_reference_pdf(self, file_path: str) -> None:
@@ -1707,13 +1710,27 @@ class MainWindow(QMainWindow):
         # Scan the COMPLETE results to collect every match from this source file.
         # This ensures all reference locations are visible and navigable, not just
         # the one that was clicked.
-        all_highlights_by_page: dict = {}
+        # Also collect target-side data (page, rect, word) for each reference rect,
+        # so hovering in the reference viewer can show a preview of the target text.
+        #
+        # IMPORTANT: Rect collection and is_current determination are separate steps.
+        # If done in a single pass, processing order can cause a shared rkey (from
+        # overlapping SW-expanded blocks) to be permanently stamped as non-current
+        # when a non-current block's target words are iterated before the current one.
         seen_rect_keys: set = set()
-        for page_highlights in self.current_results.values():
+        # Map: rkey → fitz.Rect object (the first one seen, for dedup)
+        all_rect_objects: dict = {}
+        # Map: ref_page → list of rkeys on that page (preserves insertion order)
+        rkeys_by_page: dict = {}
+        # Map: ref_rect_key → list of (target_page, target_rect, word) triples
+        target_data_by_ref_rect: dict = {}
+        for target_page_idx, page_highlights in self.current_results.items():
             for h in page_highlights:
-                if h.get("source") != file_path or h.get("ignored", False):
+                if h.source != file_path or h.ignored:
                     continue
-                for ref_page, ref_rect, _ in h.get("source_data", []):
+                # Collect the target-side triple for this highlight word
+                target_triple = (target_page_idx, h.rect, h.word)
+                for ref_page, ref_rect, _ in (h.source_data or []):
                     rkey = (
                         ref_page,
                         ref_rect.x0,
@@ -1721,13 +1738,21 @@ class MainWindow(QMainWindow):
                         ref_rect.x1,
                         ref_rect.y1,
                     )
+                    # Accumulate target data for each reference rect
+                    target_data_by_ref_rect.setdefault(rkey, []).append(target_triple)
                     if rkey in seen_rect_keys:
                         continue
                     seen_rect_keys.add(rkey)
-                    is_current = rkey in current_rect_keys
-                    if ref_page not in all_highlights_by_page:
-                        all_highlights_by_page[ref_page] = []
-                    all_highlights_by_page[ref_page].append((ref_rect, is_current))
+                    all_rect_objects[rkey] = ref_rect
+                    rkeys_by_page.setdefault(ref_page, []).append(rkey)
+
+        # Determine is_current purely from current_rect_keys (order-independent)
+        all_highlights_by_page: dict = {}
+        for ref_page, rkeys in rkeys_by_page.items():
+            all_highlights_by_page[ref_page] = [
+                (all_rect_objects[rkey], rkey in current_rect_keys)
+                for rkey in rkeys
+            ]
 
         # Fallback when there are no comparison results yet (e.g., browse mode
         # before a comparison has been run).
@@ -1777,32 +1802,67 @@ class MainWindow(QMainWindow):
             p_idx = lbl.page_index
             page_highlight_data = all_highlights_by_page.get(p_idx, [])
 
-            current_rects = [r for r, is_curr in page_highlight_data if is_curr]
-            other_rects = [r for r, is_curr in page_highlight_data if not is_curr]
+            # IMPORTANT: copy rects before merging! _merge_rects mutates rects in-place
+            # (widening x1). The originals come from reference_maps, so mutating them
+            # would permanently corrupt the shared index and break future comparisons.
+            current_rects = [fitz.Rect(r) for r, is_curr in page_highlight_data if is_curr]
+            other_rects = [fitz.Rect(r) for r, is_curr in page_highlight_data if not is_curr]
 
             merged_current = _merge_rects(current_rects)
             merged_other = _merge_rects(other_rects)
 
             highlights = []
+            # Build per-rect target preview data by finding which original
+            # rects overlap each merged rect (merging unions nearby rects,
+            # so we collect target triples from all constituents).
+            def _target_data_for_merged(merged_rect, rects_with_data):
+                """Collect target triples from original rects that overlap the merged rect."""
+                triples = []
+                for orig_r, orig_triples in rects_with_data:
+                    # Check if the original rect was merged into this merged rect
+                    if (orig_r.y0 >= merged_rect.y0 - 1 and orig_r.y1 <= merged_rect.y1 + 1
+                            and orig_r.x0 >= merged_rect.x0 - 1 and orig_r.x1 <= merged_rect.x1 + 1):
+                        triples.extend(orig_triples)
+                return triples
+
+            # Pre-compute per-rect target data
+            current_rects_with_data = []
+            other_rects_with_data = []
+            for r, is_curr in page_highlight_data:
+                rkey = (p_idx, r.x0, r.y0, r.x1, r.y1)
+                triples = target_data_by_ref_rect.get(rkey, [])
+                if is_curr:
+                    current_rects_with_data.append((r, triples))
+                else:
+                    other_rects_with_data.append((r, triples))
+
             for r in merged_other:
+                rect_triples = _target_data_for_merged(r, other_rects_with_data)
                 highlights.append(
-                    {
-                        "rect": fitz.Rect(
+                    HighlightEntry(
+                        rect=fitz.Rect(
                             r.x0 * zoom, r.y0 * zoom, r.x1 * zoom, r.y1 * zoom
                         ),
-                        "source": "OTHER_MATCH",
-                        "confidence": 0.3,
-                    }
+                        source="OTHER_MATCH",
+                        preview_source=self.current_target_file,
+                        source_data=rect_triples or None,
+                        match_id=id(r),
+                        confidence=0.3,
+                    )
                 )
             for r in merged_current:
+                rect_triples = _target_data_for_merged(r, current_rects_with_data)
                 highlights.append(
-                    {
-                        "rect": fitz.Rect(
+                    HighlightEntry(
+                        rect=fitz.Rect(
                             r.x0 * zoom, r.y0 * zoom, r.x1 * zoom, r.y1 * zoom
                         ),
-                        "source": "CURRENT_MATCH",
-                        "confidence": 1.0,
-                    }
+                        source="CURRENT_MATCH",
+                        preview_source=self.current_target_file,
+                        source_data=rect_triples or None,
+                        match_id=id(r),
+                        confidence=1.0,
+                    )
                 )
 
             lbl.color_map = {

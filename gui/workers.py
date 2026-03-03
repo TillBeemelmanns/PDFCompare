@@ -120,8 +120,8 @@ class PreviewWorker(QRunnable):
             if self._cancelled:
                 return
 
-            source_path = match.get("source")
-            data = match.get("source_data")
+            source_path = match.preview_source or match.source
+            data = match.source_data
             if not source_path or not data:
                 continue
 

@@ -13,6 +13,8 @@
   - Background render pool (`QThreadPool`, 2 threads): `_pending_bg_render_worker` for target, `_pending_bg_source_worker` for reference. Both use `PageRenderWorker` and share `_bg_render_pool`.
   - Widget pool (`self.widget_pool`): plain `list` of recycled `PDFPageLabel` instances, not a separate class.
   - Debounced target refresh (`_refresh_timer`, 150 ms) and throttled scroll handlers (`_virtual_scroll_timer`, `_source_scroll_timer`, 50 ms each).
+  - Reference viewer highlights carry reverse-preview data: `_preview_source` (target file path) and `source_data` (target-side page/rect/word triples) enable hover previews that show the corresponding target document text. Each highlight gets a unique `match_id` via `id(rect)` so the hover system can distinguish them.
+  - Statistics panel uses a 3-row layout: Row 1 = N-Grams | Memory, Row 2 = Cache, Row 3 = Matches.
 
 - **`gui/pdf_renderer.py`** — High-performance PDF rendering engine.
   - `PixmapCache` — Memory-aware LRU cache keyed by `(file_path, page_idx, zoom)`. Evicts LRU pages once estimated RAM exceeds the configured byte budget.
@@ -22,13 +24,14 @@
   - `PDFPageLabel` — Displays a PDF page as a `QLabel` with overlay highlights, hover preview, and click/ignore signals. Caches the composited highlight pixmap (`_hl_cache`) keyed by `_hl_cache_key`.
   - `PreviewPopup` — Floating tooltip showing an async-rendered crop of a source match.
   - `FileListWidget` — Drag-and-drop file list with animations and folder support.
+  - `SourcePanelWidget` — Lists reference sources with match percentages, checkboxes for visibility toggling, search/filter, and minimum-overlap threshold slider.
   - `MiniMapWidget` — Navigation heatmap for the target document.
 
 - **`gui/workers.py`** — Background workers.
   - `IndexWorker` (`QObject` / `QThread`) — Calls `PDFComparator.add_references`.
   - `CompareWorker` (`QObject` / `QThread`) — Calls `PDFComparator.compare_document`.
   - `PageRenderWorker` (`QRunnable`) — Rasterises a list of page indices into `QImage` objects off-thread; the main thread converts to `QPixmap` on callback. Used for both target and reference async rendering. Supports `cancel()`.
-  - `PreviewWorker` (`QRunnable`) — Generates cropped, highlighted preview images for hover tooltips.
+  - `PreviewWorker` (`QRunnable`) — Generates cropped, highlighted preview images for hover tooltips. Checks `_preview_source` first (used by reference-viewer highlights to preview the target document), falling back to `source` (used by target-viewer highlights to preview the reference document).
 
 - **`compare_logic.py`** — Core algorithm engine.
   - **Phase A:** N-gram shingling (`seed_size` words). Matching is parallelised via `ThreadPoolExecutor`. Supports exact (`fast`) and Levenshtein fuzzy (`fuzzy`) modes.
