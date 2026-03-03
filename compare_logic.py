@@ -596,7 +596,8 @@ class PDFComparator:
         (filtered_target, self.reference_maps) so no locking is needed.
 
         Returns:
-            (source, valid_indices, confidence, source_info, match_id)  or  None
+            (source, valid_indices, confidence, match_density, source_info, match_id)
+            or None
         """
         if block["end"] - block["start"] < 3:
             return None
@@ -649,7 +650,23 @@ class PDFComparator:
                     source_info.append((p, r, w))
 
         valid_indices = [i for i in indices if i < len(filtered_target)]
-        return (block["src"], valid_indices, confidence, source_info, id(block))
+
+        # Match density: fraction of the target span that is actually matched.
+        # Near-verbatim copies approach 1.0; sparse coincidences are low.
+        if valid_indices:
+            span = max(valid_indices) - min(valid_indices) + 1
+            match_density = len(valid_indices) / span
+        else:
+            match_density = 0.0
+
+        return (
+            block["src"],
+            valid_indices,
+            confidence,
+            match_density,
+            source_info,
+            id(block),
+        )
 
     def compare_document(
         self,
@@ -816,7 +833,9 @@ class PDFComparator:
                     )
                 if result is None:
                     continue
-                src, valid_indices, confidence, source_info, match_id = result
+                src, valid_indices, confidence, match_density, source_info, match_id = (
+                    result
+                )
                 for i in valid_indices:
                     # Statistics: every source keeps its own count (no dedup)
                     source_word_counts[src].add(i)
@@ -829,6 +848,7 @@ class PDFComparator:
                             "source_info": source_info,
                             "match_id": match_id,
                             "confidence": confidence,
+                            "match_density": match_density,
                         }
 
         # Build final highlight list — one rect per target word (no alpha stacking)
@@ -843,6 +863,7 @@ class PDFComparator:
                         "source_data": best["source_info"],
                         "match_id": best["match_id"],
                         "confidence": best["confidence"],
+                        "match_density": best.get("match_density", 0.0),
                     }
                 )
 

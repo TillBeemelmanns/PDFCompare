@@ -682,6 +682,26 @@ class MainWindow(QMainWindow):
         h_right_head.addWidget(self.lbl_intensity_val)
         h_right_head.addSpacing(6)
 
+        # Minimum confidence slider (0 – 100 %, default 0 %)
+        lbl_min_conf = QLabel("Min conf:")
+        lbl_min_conf.setStyleSheet("font-size: 11px;")
+        h_right_head.addWidget(lbl_min_conf)
+        self.slider_min_conf = QSlider(Qt.Orientation.Horizontal)
+        self.slider_min_conf.setRange(0, 100)
+        self.slider_min_conf.setValue(0)
+        self.slider_min_conf.setFixedWidth(80)
+        self.slider_min_conf.setToolTip(
+            "Minimum match confidence to display (0 % – 100 %).\n"
+            "Increase to hide low-confidence matches and focus on\n"
+            "near-identical text that may need rewriting."
+        )
+        self.slider_min_conf.valueChanged.connect(self.on_min_confidence_changed)
+        h_right_head.addWidget(self.slider_min_conf)
+        self.lbl_min_conf_val = QLabel("0%")
+        self.lbl_min_conf_val.setStyleSheet("font-size: 11px; min-width: 34px;")
+        h_right_head.addWidget(self.lbl_min_conf_val)
+        h_right_head.addSpacing(6)
+
         btn_zoom_in_t = QPushButton("+")
         btn_zoom_in_t.setFixedSize(28, 28)
         btn_zoom_in_t.setStyleSheet("font-size: 16px; font-weight: bold; padding: 0px;")
@@ -754,6 +774,20 @@ class MainWindow(QMainWindow):
         for lbl in self._page_slots:
             lbl._hl_cache_key = None
             lbl.draw_highlights()
+
+    def on_min_confidence_changed(self, value: int) -> None:
+        """Update global minimum confidence and redraw target + minimap."""
+        threshold = value / 100.0
+        PDFPageLabel.min_confidence = threshold
+        self.mini_map.min_confidence = threshold
+        self.lbl_min_conf_val.setText(f"{value}%")
+        # Invalidate highlight caches
+        for lbl in self._page_slots:
+            lbl._hl_cache_key = None
+            lbl.draw_highlights()
+        # Invalidate minimap
+        self.mini_map._lines_cache = None
+        self.mini_map.update()
 
     def toggle_source_view(self):
         self.source_stack.setCurrentIndex(1 if self.btn_toggle_view.isChecked() else 0)
@@ -991,6 +1025,8 @@ class MainWindow(QMainWindow):
                             "source": m["source"],
                             "source_data": m["source_data"],
                             "match_id": m.get("match_id"),
+                            "confidence": m.get("confidence", 0.7),
+                            "match_density": m.get("match_density", 0.0),
                         }
                     )
 

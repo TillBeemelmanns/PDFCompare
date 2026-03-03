@@ -563,6 +563,7 @@ class PDFPageLabel(QLabel):
     )  # emits match dict; main window writes phrase to disk
     show_hover_previews = True
     hl_intensity: float = 1.0  # Global multiplier for highlight alpha (0.25 – 2.0)
+    min_confidence: float = 0.0  # Global minimum confidence threshold (0.0 – 1.0)
 
     _popup = None
     _pending_preview_worker = None  # Track current preview worker for cancellation
@@ -593,12 +594,13 @@ class PDFPageLabel(QLabel):
             self._hl_cache_key = None
             return
 
-        # Return cached result when neither the highlight list, the base pixmap,
-        # nor the global intensity multiplier has changed since the last paint.
+        # Return cached result when highlights, pixmap, intensity, or threshold
+        # have not changed since the last paint.
         cache_key = (
             id(self.highlights),
             id(self.original_pixmap),
             PDFPageLabel.hl_intensity,
+            PDFPageLabel.min_confidence,
         )
         if cache_key == self._hl_cache_key and self._hl_cache is not None:
             self.setPixmap(self._hl_cache)
@@ -613,26 +615,35 @@ class PDFPageLabel(QLabel):
                 continue
             source = h.get("source", "")
             rect = h["rect"]
+            confidence = h.get("confidence", 0.7)
 
             if source in self.color_map:
                 # Source-view sentinels ("CURRENT_MATCH", "OTHER_MATCH") keep explicit color
                 base = self.color_map[source]
                 color = QColor(base.red(), base.green(), base.blue(), base.alpha())
-                confidence = h.get("confidence", 0.7)
             else:
-                # Target-view highlights: amber, opacity = confidence × global intensity
-                confidence = h.get("confidence", 0.7)
-                alpha = int(
-                    min(255, (30 + confidence * 60) * PDFPageLabel.hl_intensity)
-                )
-                color = QColor(250, 170, 30, alpha)
+                # Skip matches below the global confidence threshold
+                if confidence < PDFPageLabel.min_confidence:
+                    continue
+
+                # Two-tier coloring:
+                #   Red/coral (critical) — confidence ≥ 0.80
+                #   Amber (informational) — confidence < 0.80
+                if confidence >= 0.80:
+                    base_alpha = 50 + confidence * 80  # 114 … 130
+                    alpha = int(min(255, base_alpha * PDFPageLabel.hl_intensity))
+                    color = QColor(243, 139, 168, alpha)  # Catppuccin Red
+                else:
+                    base_alpha = 30 + confidence * 60
+                    alpha = int(min(255, base_alpha * PDFPageLabel.hl_intensity))
+                    color = QColor(250, 170, 30, alpha)  # Amber
 
             painter.setBrush(color)
             qrect = QRectF(rect.x0, rect.y0, rect.width, rect.height)
 
-            # Draw border for high-confidence matches (>80%)
-            if confidence >= 0.8:
-                border_color = QColor(color.red(), color.green(), color.blue(), 160)
+            # Red-tier matches always get a visible border
+            if confidence >= 0.8 and source not in self.color_map:
+                border_color = QColor(243, 139, 168, 180)
                 pen = QPen(border_color)
                 pen.setWidth(2)
                 painter.setPen(pen)
@@ -856,6 +867,7 @@ class MiniMapWidget(QWidget):
         self.page_heights = []
         self.viewport_pos = 0.0
         self.viewport_height = 0.1
+        self.min_confidence = 0.0  # Synced with PDFPageLabel.min_confidence
         self._lines_cache: QPixmap | None = None  # Pre-rendered match markers
 
     def set_data(self, matches, total_pages, page_heights=None):
@@ -907,6 +919,9 @@ class MiniMapWidget(QWidget):
             for m in matches:
                 if m.get("ignored", False):
                     continue
+                confidence = m.get("confidence", 0.7)
+                if confidence < self.min_confidence:
+                    continue
                 r = m["rect"]
                 y_pixel = int(((page_base_y + r.y0) / total_doc_height) * h)
 
@@ -916,7 +931,11 @@ class MiniMapWidget(QWidget):
                 alpha = int(40 + weight * 210)  # 40 (tiny) → 250 (large)
                 line_width = max(1, round(1 + weight * 2))  # 1 px → 3 px
 
-                color = QColor(250, 170, 30)
+                # Red for critical (≥ 0.80), amber for informational
+                if confidence >= 0.80:
+                    color = QColor(243, 139, 168)
+                else:
+                    color = QColor(250, 170, 30)
                 color.setAlpha(alpha)
                 pen = QPen(color)
                 pen.setWidth(line_width)
