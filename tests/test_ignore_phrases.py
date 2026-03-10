@@ -180,7 +180,7 @@ class TestCompareDocumentIgnoresPhrases(unittest.TestCase):
         words = []
         for hl_list in results.values():
             for h in hl_list:
-                words.append(h["word"].lower())
+                words.append(h.word.lower())
         return words
 
     def _write_ignore(self, *phrases):

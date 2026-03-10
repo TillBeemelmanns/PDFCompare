@@ -1,6 +1,6 @@
 # PDFCompare
 
-A local-first, forensic PDF comparison tool built with PyQt6.
+A local-first, precise PDF comparison tool built with PyQt6.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)

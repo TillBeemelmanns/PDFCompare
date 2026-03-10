@@ -8,7 +8,7 @@
     *   **Phase A:** Fast N-Gram shingling for initial candidate filtering (parallelized).
     *   **Phase B:** Smith-Waterman local alignment for precise, gap-tolerant match refinement (NumPy/Parasail optimized).
 *   **Visual Comparison:**
-    *   **Target Viewer:** Displays the suspect document with color-coded highlights.
+    *   **Target Viewer:** Displays the target document with color-coded highlights.
     *   **Reference Viewer:** Side-by-side view of the source document, automatically scrolled to the matching text.
     *   **Mini-Map:** High-level heatmap of matches for quick navigation.
     *   **Image Tooltips:** Hover over matches to see an instant image preview of the source text.
