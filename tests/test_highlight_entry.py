@@ -124,9 +124,7 @@ class TestHighlightEntryFromCompareDocument(unittest.TestCase):
         for page_idx, entries in results.items():
             for entry in entries:
                 self.assertTrue(entry.source, "source must be a non-empty string")
-                self.assertIsNotNone(
-                    entry.source_data, "source_data must not be None"
-                )
+                self.assertIsNotNone(entry.source_data, "source_data must not be None")
                 self.assertIsNotNone(entry.match_id, "match_id must not be None")
                 self.assertGreater(entry.confidence, 0.0)
                 self.assertIsInstance(entry.rect, fitz.Rect)
@@ -186,7 +184,7 @@ class TestReferenceViewerHighlightPipeline(unittest.TestCase):
                 if h.source != file_path or h.ignored:
                     continue
                 target_triple = (target_page_idx, h.rect, h.word)
-                for ref_page, ref_rect, _ in (h.source_data or []):
+                for ref_page, ref_rect, _ in h.source_data or []:
                     rkey = (
                         ref_page,
                         ref_rect.x0,
@@ -384,9 +382,7 @@ class TestReferenceViewerHighlightPipeline(unittest.TestCase):
             ]
         }
 
-        current_rect_keys = self._build_current_rect_keys(
-            [(0, ref_rect, "match")]
-        )
+        current_rect_keys = self._build_current_rect_keys([(0, ref_rect, "match")])
         highlights, _ = self._collect_and_classify(
             current_results, "/ref.pdf", current_rect_keys
         )
