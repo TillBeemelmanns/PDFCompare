@@ -132,6 +132,7 @@ class MainWindow(QMainWindow):
         self.current_match_list = []
         self.current_match_index = 0
         self.widget_pool = []  # Pool for PDFPageLabel reuse
+        self._MAX_POOL_SIZE = 50  # Cap to prevent unbounded memory growth
 
         # Reference-viewer navigation: sorted list of reference page indices that
         # have highlight marks; _source_match_page_idx is the current position.
@@ -797,6 +798,26 @@ class MainWindow(QMainWindow):
             if self.btn_toggle_view.isChecked()
             else "Switch to Text View"
         )
+        # Lazy-load text content on first switch to text view
+        if self.btn_toggle_view.isChecked() and getattr(
+            self, "_source_text_dirty", False
+        ):
+            self._populate_source_text()
+
+    def _populate_source_text(self):
+        """Extract text from the current source PDF and populate the text editor."""
+        fp = getattr(self, "_source_virtual_file", None)
+        if not fp:
+            return
+        doc = fitz.open(fp)
+        full_text = ""
+        for page_idx, page in enumerate(doc):
+            full_text += (
+                f"--- Page {page_idx + 1} ---\n" + page.get_text("text") + "\n\n"
+            )
+        doc.close()
+        self.source_text_edit.setText(full_text)
+        self._source_text_dirty = False
 
     def refresh_target_view(self):
         """Debounced entry point — coalesces rapid calls (legend toggles, zoom) into one."""
@@ -973,11 +994,14 @@ class MainWindow(QMainWindow):
             self._pending_bg_render_worker.cancel()
             self._pending_bg_render_worker = None
 
-        # Pool existing page widgets for reuse
+        # Pool existing page widgets for reuse (capped to prevent memory bloat)
         for lbl in self._page_slots:
-            lbl.setParent(None)
-            lbl.hide()
-            self.widget_pool.append(lbl)
+            if len(self.widget_pool) < self._MAX_POOL_SIZE:
+                lbl.setParent(None)
+                lbl.hide()
+                self.widget_pool.append(lbl)
+            else:
+                lbl.deleteLater()
 
         self._page_slots = []
         self._page_slot_data = []
@@ -998,12 +1022,9 @@ class MainWindow(QMainWindow):
             self._target_page_y_offsets.append(y)
             y += h + 10  # matches addSpacing(10)
 
-        # Pre-render first ~2 viewport heights in one fitz open
-        vh = max(self.target_scroll.viewport().height(), 600)
-        prerender_pages = [
-            i for i, y_off in enumerate(self._target_page_y_offsets) if y_off < vh * 2
-        ]
-        self.target_renderer.batch_prerender(file_path, prerender_pages, zoom)
+        # Pre-render only the first visible page synchronously;
+        # the background PageRenderWorker handles the rest without blocking.
+        self.target_renderer.batch_prerender(file_path, [0] if n_pages else [], zoom)
 
         # Create all page widgets and add them to the layout once.
         # Widgets stay in the layout forever; only their pixmaps are swapped.
@@ -1189,7 +1210,10 @@ class MainWindow(QMainWindow):
         lbl.setFixedSize(pixmap.width(), pixmap.height())
         lbl.move(0, int(self._target_page_y_offsets[page_idx]))
         lbl.show()
-        lbl.draw_highlights()
+        if lbl.highlights:
+            lbl.draw_highlights()
+        else:
+            lbl.setPixmap(lbl.original_pixmap)
         self._page_slot_data[page_idx]["materialized"] = True
 
     def _dematerialize_target_page(self, page_idx: int) -> None:
@@ -1277,7 +1301,10 @@ class MainWindow(QMainWindow):
         lbl.setFixedSize(pixmap.width(), pixmap.height())
         lbl.move(0, int(self._source_page_y_offsets[slot_idx]))
         lbl.show()
-        lbl.draw_highlights()
+        if lbl.highlights:
+            lbl.draw_highlights()
+        else:
+            lbl.setPixmap(lbl.original_pixmap)
         self._source_page_slot_data[slot_idx]["materialized"] = True
 
     def _dematerialize_source_page(self, slot_idx: int) -> None:
@@ -1341,13 +1368,10 @@ class MainWindow(QMainWindow):
         self.ignored_match_ids = set()
         self.last_rendered_source = None
         self.last_rendered_zoom = None
-        self._page_slots = []
-        self._page_slot_data = []
-        self._source_page_slots = []
-        self._source_page_slot_data = []
-
         # Delete all target page widgets and discard pool
         for lbl in self._page_slots:
+            lbl.deleteLater()
+        for lbl in self.widget_pool:
             lbl.deleteLater()
         self.widget_pool.clear()
         self.target_container.setMinimumHeight(0)
@@ -1356,6 +1380,11 @@ class MainWindow(QMainWindow):
         for lbl in self._source_page_slots:
             lbl.deleteLater()
         self.source_container.setMinimumHeight(0)
+
+        self._page_slots = []
+        self._page_slot_data = []
+        self._source_page_slots = []
+        self._source_page_slot_data = []
 
         self.source_panel.clear()
         self.source_panel.set_active_file(None)
@@ -1606,11 +1635,14 @@ class MainWindow(QMainWindow):
             self.last_rendered_source = file_path
             self.last_rendered_zoom = self.zoom_level
 
-            # Pool existing source page widgets for reuse
+            # Pool existing source page widgets for reuse (capped)
             for lbl in self._source_page_slots:
-                lbl.setParent(None)
-                lbl.hide()
-                self.widget_pool.append(lbl)
+                if len(self.widget_pool) < self._MAX_POOL_SIZE:
+                    lbl.setParent(None)
+                    lbl.hide()
+                    self.widget_pool.append(lbl)
+                else:
+                    lbl.deleteLater()
 
             self._source_page_slots = []
             self._source_page_slot_data = []
@@ -1631,24 +1663,14 @@ class MainWindow(QMainWindow):
                 self._source_page_y_offsets.append(y)
                 y += h + 10
 
-            # Pre-render: first viewport + target page area (all while doc is open)
-            vh = max(self.source_scroll.viewport().height(), 600)
-            tp_y = (
-                self._source_page_y_offsets[tp]
-                if tp is not None and tp < len(self._source_page_y_offsets)
-                else 0
+            # Pre-render only the scroll-target page (or page 0) synchronously;
+            # the background PageRenderWorker handles the rest without blocking.
+            first_page = (
+                tp if tp is not None and tp < len(self._source_page_y_offsets) else 0
             )
-            prerender_pages = list(
-                {
-                    i
-                    for i, y_off in enumerate(self._source_page_y_offsets)
-                    if y_off < vh * 2 or abs(y_off - tp_y) < vh * 1.5
-                }
-            )
-            self.source_renderer.batch_prerender(file_path, prerender_pages, zoom, doc)
+            self.source_renderer.batch_prerender(file_path, [first_page], zoom, doc)
 
-            # Build all widgets with empty pixmaps + fixed sizes; extract text
-            full_text = ""
+            # Build all widgets with empty pixmaps + fixed sizes
             for page_idx, page in enumerate(doc):
                 w_px, h_px = self._source_page_dims[page_idx]
 
@@ -1684,12 +1706,12 @@ class MainWindow(QMainWindow):
                 self._source_page_slots.append(lbl)
                 self._source_page_slot_data.append({"materialized": False})
 
-                full_text += (
-                    f"--- Page {page_idx + 1} ---\n" + page.get_text("text") + "\n\n"
-                )
-
             doc.close()
-            self.source_text_edit.setText(full_text)
+
+            # Defer text extraction — only populate when Text View is active
+            self._source_text_dirty = True
+            if self.source_stack.currentIndex() == 1:
+                self._populate_source_text()
 
             # Set container height so the scrollbar covers all pages
             if self._source_page_dims:
@@ -1889,28 +1911,32 @@ class MainWindow(QMainWindow):
         # Materialize visible source pages (first load or after highlight refresh)
         QTimer.singleShot(0, self._update_visible_source_pages)
 
-        # Text Edit Highlighting
-        doc_obj = self.source_text_edit.document()
-        extra = []
-        for p_idx in sorted(set(x[0] for x in source_data)):
-            pw = [x[2] for x in source_data if x[0] == p_idx]
-            hdr = f"--- Page {p_idx + 1} ---"
-            start = doc_obj.find(hdr)
-            if not start.isNull():
-                for word in set(pw):
-                    if len(word) < 3:
-                        continue
-                    spos = start.selectionEnd()
-                    while True:
-                        cur = doc_obj.find(word, spos)
-                        if cur.isNull() or cur.position() > start.selectionEnd() + 5000:
-                            break
-                        sel = QTextEdit.ExtraSelection()
-                        sel.format.setBackground(QColor(Theme.YELLOW))
-                        sel.cursor = cur
-                        extra.append(sel)
-                        spos = cur.selectionEnd()
-        self.source_text_edit.setExtraSelections(extra)
+        # Text Edit Highlighting — only if text view has been populated
+        if not getattr(self, "_source_text_dirty", True):
+            doc_obj = self.source_text_edit.document()
+            extra = []
+            for p_idx in sorted(set(x[0] for x in source_data)):
+                pw = [x[2] for x in source_data if x[0] == p_idx]
+                hdr = f"--- Page {p_idx + 1} ---"
+                start = doc_obj.find(hdr)
+                if not start.isNull():
+                    for word in set(pw):
+                        if len(word) < 3:
+                            continue
+                        spos = start.selectionEnd()
+                        while True:
+                            cur = doc_obj.find(word, spos)
+                            if (
+                                cur.isNull()
+                                or cur.position() > start.selectionEnd() + 5000
+                            ):
+                                break
+                            sel = QTextEdit.ExtraSelection()
+                            sel.format.setBackground(QColor(Theme.YELLOW))
+                            sel.cursor = cur
+                            extra.append(sel)
+                            spos = cur.selectionEnd()
+            self.source_text_edit.setExtraSelections(extra)
 
         # Scroll with delay to ensure container height is applied
         if scroll_page is not None and scroll_page < len(self._source_page_y_offsets):
@@ -1921,15 +1947,16 @@ class MainWindow(QMainWindow):
                 self._update_visible_source_pages()
 
             QTimer.singleShot(50, _scroll_source)
-            hdr_to_find = f"--- Page {scroll_page + 1} ---"
-            cursor = doc_obj.find(hdr_to_find)
-            if not cursor.isNull():
-                QTimer.singleShot(
-                    50, lambda: self.source_text_edit.setTextCursor(cursor)
-                )
-                QTimer.singleShot(
-                    50, lambda: self.source_text_edit.ensureCursorVisible()
-                )
+            if not getattr(self, "_source_text_dirty", True):
+                hdr_to_find = f"--- Page {scroll_page + 1} ---"
+                cursor = self.source_text_edit.document().find(hdr_to_find)
+                if not cursor.isNull():
+                    QTimer.singleShot(
+                        50, lambda: self.source_text_edit.setTextCursor(cursor)
+                    )
+                    QTimer.singleShot(
+                        50, lambda: self.source_text_edit.ensureCursorVisible()
+                    )
 
         # Show/hide ◀▶ navigation buttons based on number of highlighted pages
         self.update_match_controls()
