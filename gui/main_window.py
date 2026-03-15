@@ -145,6 +145,7 @@ class MainWindow(QMainWindow):
         self._target_page_dims: list = []
         self._target_page_y_offsets: list = []
         self._target_virtual_file: str = None
+        self._target_rendered_zoom: float = 0.0  # zoom level of current page widgets
 
         # Virtual scroll state — source view
         self._source_page_slots: list = []
@@ -840,6 +841,23 @@ class MainWindow(QMainWindow):
             if fm:
                 filtered[p_idx] = fm
 
+        # Fast path: if zoom and file haven't changed, update highlights in-place
+        # instead of tearing down and rebuilding all widgets.
+        zoom = self.zoom_level
+        if (
+            self._page_slots
+            and self._target_virtual_file == self.current_target_file
+            and self._target_rendered_zoom == zoom
+            and len(self._page_slots) == len(self._target_page_dims)
+        ):
+            self._update_target_highlights_inplace(filtered, zoom)
+            self.mini_map.set_data(
+                filtered,
+                self.current_total_pages,
+                getattr(self, "current_page_heights", None),
+            )
+            return
+
         saved_scroll = self.target_scroll.verticalScrollBar().value()
         self.render_target(
             self.current_target_file, filtered, restore_scroll=saved_scroll
@@ -849,6 +867,43 @@ class MainWindow(QMainWindow):
             self.current_total_pages,
             getattr(self, "current_page_heights", None),
         )
+
+    def _update_target_highlights_inplace(self, filtered: dict, zoom: float) -> None:
+        """Update highlights on existing page widgets without rebuilding them.
+
+        Only the highlight lists are recalculated from *filtered*; page geometry,
+        pixmaps, and widget instances remain untouched.  Materialized pages get
+        their highlight caches invalidated and immediately repainted.
+        """
+        for page_idx, lbl in enumerate(self._page_slots):
+            new_highlights = []
+            if page_idx in filtered:
+                for m in filtered[page_idx]:
+                    new_highlights.append(
+                        HighlightEntry(
+                            rect=fitz.Rect(
+                                m.rect.x0 * zoom,
+                                m.rect.y0 * zoom,
+                                m.rect.x1 * zoom,
+                                m.rect.y1 * zoom,
+                            ),
+                            source=m.source,
+                            source_data=m.source_data,
+                            match_id=m.match_id,
+                            confidence=m.confidence,
+                            match_density=m.match_density,
+                        )
+                    )
+
+            lbl.highlights = new_highlights
+            self._page_slot_data[page_idx]["highlights"] = new_highlights
+            lbl._hl_cache_key = None  # invalidate cached highlight render
+
+            if self._page_slot_data[page_idx]["materialized"]:
+                if new_highlights:
+                    lbl.draw_highlights()
+                else:
+                    lbl.setPixmap(lbl.original_pixmap)
 
     def _on_worker_error(self, title: str, message: str, thread: QThread) -> None:
         """Handle an error emitted by a background worker: stop thread, reset UI."""
@@ -1006,6 +1061,7 @@ class MainWindow(QMainWindow):
         self._page_slots = []
         self._page_slot_data = []
         self._target_virtual_file = file_path
+        self._target_rendered_zoom = self.zoom_level
 
         zoom = self.zoom_level
 

@@ -11,7 +11,7 @@ import fitz
 from collections import OrderedDict
 from typing import Optional
 from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtCore import QObject
+from PyQt6.QtCore import QObject, QTimer
 
 
 class PixmapCache:
@@ -104,6 +104,34 @@ class PDFRenderer(QObject):
         super().__init__()
         self.pixmap_cache = PixmapCache(max_bytes=max_bytes)
 
+        # Cached fitz document handle — avoids repeated open/close per page.
+        # Automatically closed after 2 seconds of inactivity.
+        self._cached_doc = None
+        self._cached_doc_path: str | None = None
+        self._doc_timer = QTimer()
+        self._doc_timer.setSingleShot(True)
+        self._doc_timer.setInterval(2000)
+        self._doc_timer.timeout.connect(self._close_cached_doc)
+
+    def _get_doc(self, file_path: str):
+        """Return a fitz.Document for file_path, reusing a cached handle if available."""
+        if self._cached_doc is not None and self._cached_doc_path == file_path:
+            self._doc_timer.start()  # reset keep-alive
+            return self._cached_doc
+        self._close_cached_doc()
+        self._cached_doc = fitz.open(file_path)
+        self._cached_doc_path = file_path
+        self._doc_timer.start()
+        return self._cached_doc
+
+    def _close_cached_doc(self) -> None:
+        """Close the cached fitz document handle."""
+        if self._cached_doc is not None:
+            self._cached_doc.close()
+            self._cached_doc = None
+            self._cached_doc_path = None
+        self._doc_timer.stop()
+
     def get_cached_pixmap(self, file_path: str, page_idx: int, zoom: float) -> QPixmap:
         """
         Get a pixmap for a PDF page, using cache if available.
@@ -132,33 +160,34 @@ class PDFRenderer(QObject):
 
     def _render_pixmap(self, file_path: str, page_idx: int, zoom: float) -> QPixmap:
         """Generate a QPixmap from a PDF page."""
-        doc = fitz.open(file_path)
-        try:
-            page = doc[page_idx]
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat)
+        doc = self._get_doc(file_path)
+        page = doc[page_idx]
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat)
 
-            qimg = QImage(
-                pix.samples,
-                pix.width,
-                pix.height,
-                pix.stride,
-                QImage.Format.Format_RGB888,
-            ).copy()  # Copy to own the data
+        qimg = QImage(
+            pix.samples,
+            pix.width,
+            pix.height,
+            pix.stride,
+            QImage.Format.Format_RGB888,
+        ).copy()  # Copy to own the data
 
-            return QPixmap.fromImage(qimg)
-        finally:
-            doc.close()
+        return QPixmap.fromImage(qimg)
 
     def invalidate_cache(self, file_path: Optional[str] = None) -> None:
         """Clear cache entries, optionally for a specific file."""
         if file_path:
             self.pixmap_cache.invalidate_file(file_path)
+            if self._cached_doc_path == file_path:
+                self._close_cached_doc()
         else:
+            self._close_cached_doc()
             self.pixmap_cache.clear()
 
     def cleanup(self) -> None:
         """Release all resources."""
+        self._close_cached_doc()
         self.pixmap_cache.clear()
 
     def get_page_dimensions(
@@ -175,14 +204,11 @@ class PDFRenderer(QObject):
             List of (width_px, height_px) tuples for each page
         """
         zoom_key = round(zoom, 2)
-        doc = fitz.open(file_path)
+        doc = self._get_doc(file_path)
         dims = []
-        try:
-            for page in doc:
-                rect = page.rect
-                dims.append((rect.width * zoom_key, rect.height * zoom_key))
-        finally:
-            doc.close()
+        for page in doc:
+            rect = page.rect
+            dims.append((rect.width * zoom_key, rect.height * zoom_key))
         return dims
 
     def batch_prerender(
