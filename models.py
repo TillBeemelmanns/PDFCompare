@@ -36,9 +36,10 @@ class HighlightEntry:
     """Alignment confidence score (0.0–1.0)."""
 
     source_data: list | None = None
-    """``(page, fitz.Rect, word)`` triples pointing to the
-    preview document (reference doc for target viewer, target doc for
-    reference viewer)."""
+    """``(page, rect, word)`` triples pointing to the preview document
+    (reference doc for target viewer, target doc for reference viewer).
+    ``rect`` is a plain ``(x0, y0, x1, y1)`` tuple from reference_maps
+    or a ``fitz.Rect`` from target highlights."""
 
     match_id: int | None = None
     """Unique identifier linking all words of the same match block."""

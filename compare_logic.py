@@ -369,25 +369,16 @@ class PDFComparator:
             ]
             self._save_index_cache(file_path, filtered_raw)
 
-        # Reconstruct with fitz.Rect objects (fast, no I/O)
-        filtered = [
-            (
-                i,
-                norm,
-                [
-                    (p, fitz.Rect(rx0, ry0, rx1, ry1), w)
-                    for p, (rx0, ry0, rx1, ry1), w in parts_raw
-                ],
-            )
-            for i, norm, parts_raw in filtered_raw
-        ]
-
-        ref_map = [(parts, norm) for (_, norm, parts) in filtered]
+        # Keep raw tuples — fitz.Rect is only needed at the GUI boundary.
+        # reference_maps stores compact (page, (x0,y0,x1,y1), word) tuples.
+        ref_map = [(parts, norm) for (_, norm, parts) in filtered_raw]
         gram_entries = [
             (self._hash(gram), file_path, idx)
-            for idx, gram in self._generate_grams(filtered, self.seed_size)
+            for idx, gram in self._generate_grams(filtered_raw, self.seed_size)
         ]
-        word_entries = [(norm_word, file_path, idx) for idx, norm_word, _ in filtered]
+        word_entries = [
+            (norm_word, file_path, idx) for idx, norm_word, _ in filtered_raw
+        ]
         return file_path, ref_map, gram_entries, word_entries
 
     def add_references(

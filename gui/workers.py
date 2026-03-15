@@ -110,69 +110,80 @@ class PreviewWorker(QRunnable):
         self._cancelled = True
 
     def run(self):
-        """Generate preview images for all matches."""
+        """Generate preview images for all matches.
+
+        Documents are opened at most once per source file path and reused
+        across matches that share the same file, avoiding repeated fitz.open
+        overhead for hover previews.
+        """
         if self._cancelled:
             return
 
         pixmaps = []
+        open_docs: dict = {}
 
-        for match in self.matches:
-            if self._cancelled:
-                return
+        try:
+            for match in self.matches:
+                if self._cancelled:
+                    return
 
-            source_path = match.preview_source or match.source
-            data = match.source_data
-            if not source_path or not data:
-                continue
+                source_path = match.preview_source or match.source
+                data = match.source_data
+                if not source_path or not data:
+                    continue
 
-            page_idx = data[0][0]
-            rects = [fitz.Rect(item[1]) for item in data if item[0] == page_idx]
-            if not rects:
-                continue
+                page_idx = data[0][0]
+                rects = [fitz.Rect(item[1]) for item in data if item[0] == page_idx]
+                if not rects:
+                    continue
 
-            # Calculate bounding box
-            bbox = rects[0]
-            for r in rects[1:]:
-                bbox |= r
+                # Calculate bounding box
+                bbox = rects[0]
+                for r in rects[1:]:
+                    bbox |= r
 
-            # Add margin
-            margin = 30
-            bbox.x0 = max(0, bbox.x0 - margin)
-            bbox.y0 = max(0, bbox.y0 - margin)
-            bbox.x1 += margin
-            bbox.y1 += margin
+                # Add margin
+                margin = 30
+                bbox.x0 = max(0, bbox.x0 - margin)
+                bbox.y0 = max(0, bbox.y0 - margin)
+                bbox.x1 += margin
+                bbox.y1 += margin
 
-            # Render page region
-            doc = fitz.open(source_path)
-            page = doc[page_idx]
-            zoom = 1.5
-            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=bbox)
+                # Reuse open document for same source file
+                if source_path not in open_docs:
+                    open_docs[source_path] = fitz.open(source_path)
+                doc = open_docs[source_path]
 
-            qimg = QImage(
-                pix.samples,
-                pix.width,
-                pix.height,
-                pix.stride,
-                QImage.Format.Format_RGB888,
-            ).copy()
+                page = doc[page_idx]
+                zoom = 1.5
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=bbox)
 
-            doc.close()
+                qimg = QImage(
+                    pix.samples,
+                    pix.width,
+                    pix.height,
+                    pix.stride,
+                    QImage.Format.Format_RGB888,
+                ).copy()
 
-            # Draw highlights
-            painter = QPainter(qimg)
-            color = self.color_map.get(source_path, QColor(255, 0, 0, 60))
-            if color.alpha() < 80:
-                color.setAlpha(80)
-            painter.setBrush(color)
-            painter.setPen(Qt.PenStyle.NoPen)
+                # Draw highlights
+                painter = QPainter(qimg)
+                color = self.color_map.get(source_path, QColor(255, 0, 0, 60))
+                if color.alpha() < 80:
+                    color.setAlpha(80)
+                painter.setBrush(color)
+                painter.setPen(Qt.PenStyle.NoPen)
 
-            for r in rects:
-                rx0 = (r.x0 - bbox.x0) * zoom
-                ry0 = (r.y0 - bbox.y0) * zoom
-                painter.drawRect(QRectF(rx0, ry0, r.width * zoom, r.height * zoom))
+                for r in rects:
+                    rx0 = (r.x0 - bbox.x0) * zoom
+                    ry0 = (r.y0 - bbox.y0) * zoom
+                    painter.drawRect(QRectF(rx0, ry0, r.width * zoom, r.height * zoom))
 
-            painter.end()
-            pixmaps.append(QPixmap.fromImage(qimg))
+                painter.end()
+                pixmaps.append(QPixmap.fromImage(qimg))
+        finally:
+            for doc in open_docs.values():
+                doc.close()
 
         if not self._cancelled:
             self.signals.finished.emit(pixmaps, self.match_ids)

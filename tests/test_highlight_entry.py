@@ -143,7 +143,10 @@ class TestHighlightEntryFromCompareDocument(unittest.TestCase):
         self.assertGreater(len(words_found), 0, "Expected words in result entries")
 
     def test_source_data_format(self):
-        """source_data must contain (page_idx, fitz.Rect, word) triples."""
+        """source_data must contain (page_idx, rect, word) triples.
+
+        Reference-side rects are plain (x0, y0, x1, y1) tuples.
+        """
         comp = PDFComparator()
         comp.add_references([self.ref_path])
         results, total, stats = comp.compare_document(self.target_path)
@@ -155,7 +158,8 @@ class TestHighlightEntryFromCompareDocument(unittest.TestCase):
                         self.assertEqual(len(triple), 3)
                         page, rect, word = triple
                         self.assertIsInstance(page, int)
-                        self.assertIsInstance(rect, fitz.Rect)
+                        self.assertIsInstance(rect, tuple)
+                        self.assertEqual(len(rect), 4)
                         self.assertIsInstance(word, str)
 
 
@@ -169,7 +173,7 @@ class TestReferenceViewerHighlightPipeline(unittest.TestCase):
         """Reproduce the current_rect_keys building from load_source_view."""
         keys = set()
         for ref_page, ref_rect, _ in source_data:
-            keys.add((ref_page, ref_rect.x0, ref_rect.y0, ref_rect.x1, ref_rect.y1))
+            keys.add((ref_page, *ref_rect))
         return keys
 
     def _collect_and_classify(self, current_results, file_path, current_rect_keys):
@@ -185,18 +189,12 @@ class TestReferenceViewerHighlightPipeline(unittest.TestCase):
                     continue
                 target_triple = (target_page_idx, h.rect, h.word)
                 for ref_page, ref_rect, _ in h.source_data or []:
-                    rkey = (
-                        ref_page,
-                        ref_rect.x0,
-                        ref_rect.y0,
-                        ref_rect.x1,
-                        ref_rect.y1,
-                    )
+                    rkey = (ref_page, *ref_rect)
                     target_data_by_ref_rect.setdefault(rkey, []).append(target_triple)
                     if rkey in seen_rect_keys:
                         continue
                     seen_rect_keys.add(rkey)
-                    all_rect_objects[rkey] = ref_rect
+                    all_rect_objects[rkey] = fitz.Rect(ref_rect)
                     rkeys_by_page.setdefault(ref_page, []).append(rkey)
 
         all_highlights_by_page = {}
@@ -208,8 +206,8 @@ class TestReferenceViewerHighlightPipeline(unittest.TestCase):
 
     def test_current_match_marked_correctly(self):
         """Rects from the clicked match must be marked is_current=True."""
-        ref_rect_a = fitz.Rect(10, 20, 100, 30)
-        ref_rect_b = fitz.Rect(10, 40, 100, 50)
+        ref_rect_a = (10, 20, 100, 30)
+        ref_rect_b = (10, 40, 100, 50)
 
         source_data_a = [(0, ref_rect_a, "word_a")]
         source_data_b = [(0, ref_rect_b, "word_b")]
@@ -246,14 +244,14 @@ class TestReferenceViewerHighlightPipeline(unittest.TestCase):
 
         for rect, is_current in rects_and_flags:
             rkey = (0, rect.x0, rect.y0, rect.x1, rect.y1)
-            if rkey == (0, ref_rect_a.x0, ref_rect_a.y0, ref_rect_a.x1, ref_rect_a.y1):
+            if rkey == (0, *ref_rect_a):
                 self.assertTrue(is_current, "Match A should be current")
             else:
                 self.assertFalse(is_current, "Match B should be other")
 
     def test_order_independence(self):
         """is_current must not depend on which page is processed first."""
-        shared_rect = fitz.Rect(10, 20, 100, 30)
+        shared_rect = (10, 20, 100, 30)
 
         source_data_current = [(0, shared_rect, "shared")]
         source_data_other = [(0, shared_rect, "shared")]
@@ -296,7 +294,7 @@ class TestReferenceViewerHighlightPipeline(unittest.TestCase):
 
     def test_ignored_matches_excluded(self):
         """Ignored highlights must not contribute rects to the reference view."""
-        ref_rect = fitz.Rect(10, 20, 100, 30)
+        ref_rect = (10, 20, 100, 30)
         source_data = [(0, ref_rect, "word")]
 
         current_results = {
@@ -311,7 +309,7 @@ class TestReferenceViewerHighlightPipeline(unittest.TestCase):
                 HighlightEntry(
                     rect=fitz.Rect(5, 20, 50, 30),
                     source="/ref.pdf",
-                    source_data=[(0, fitz.Rect(10, 50, 100, 60), "hidden")],
+                    source_data=[(0, (10, 50, 100, 60), "hidden")],
                     match_id=2,
                     word="ignored_word",
                     ignored=True,
@@ -330,7 +328,7 @@ class TestReferenceViewerHighlightPipeline(unittest.TestCase):
 
     def test_target_data_collected(self):
         """target_data_by_ref_rect must map ref rkeys to target triples."""
-        ref_rect = fitz.Rect(10, 20, 100, 30)
+        ref_rect = (10, 20, 100, 30)
         target_rect = fitz.Rect(5, 5, 50, 15)
         source_data = [(0, ref_rect, "ref_word")]
 
@@ -351,7 +349,7 @@ class TestReferenceViewerHighlightPipeline(unittest.TestCase):
             current_results, "/ref.pdf", current_rect_keys
         )
 
-        rkey = (0, ref_rect.x0, ref_rect.y0, ref_rect.x1, ref_rect.y1)
+        rkey = (0, *ref_rect)
         self.assertIn(rkey, target_data)
         triples = target_data[rkey]
         self.assertEqual(len(triples), 1)
@@ -361,7 +359,7 @@ class TestReferenceViewerHighlightPipeline(unittest.TestCase):
 
     def test_different_source_files_excluded(self):
         """Highlights from a different source file must not appear."""
-        ref_rect = fitz.Rect(10, 20, 100, 30)
+        ref_rect = (10, 20, 100, 30)
 
         current_results = {
             0: [
@@ -375,7 +373,7 @@ class TestReferenceViewerHighlightPipeline(unittest.TestCase):
                 HighlightEntry(
                     rect=fitz.Rect(5, 20, 50, 30),
                     source="/other_ref.pdf",
-                    source_data=[(0, fitz.Rect(10, 50, 100, 60), "other")],
+                    source_data=[(0, (10, 50, 100, 60), "other")],
                     match_id=2,
                     word="other",
                 ),

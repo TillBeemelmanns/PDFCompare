@@ -1787,9 +1787,7 @@ class MainWindow(QMainWindow):
         # Keys identifying which reference rects belong to the actively-clicked match
         current_rect_keys: set = set()
         for ref_page, ref_rect, _ in source_data:
-            current_rect_keys.add(
-                (ref_page, ref_rect.x0, ref_rect.y0, ref_rect.x1, ref_rect.y1)
-            )
+            current_rect_keys.add((ref_page, *ref_rect))
 
         # Scan the COMPLETE results to collect every match from this source file.
         # This ensures all reference locations are visible and navigable, not just
@@ -1815,19 +1813,13 @@ class MainWindow(QMainWindow):
                 # Collect the target-side triple for this highlight word
                 target_triple = (target_page_idx, h.rect, h.word)
                 for ref_page, ref_rect, _ in h.source_data or []:
-                    rkey = (
-                        ref_page,
-                        ref_rect.x0,
-                        ref_rect.y0,
-                        ref_rect.x1,
-                        ref_rect.y1,
-                    )
+                    rkey = (ref_page, *ref_rect)
                     # Accumulate target data for each reference rect
                     target_data_by_ref_rect.setdefault(rkey, []).append(target_triple)
                     if rkey in seen_rect_keys:
                         continue
                     seen_rect_keys.add(rkey)
-                    all_rect_objects[rkey] = ref_rect
+                    all_rect_objects[rkey] = fitz.Rect(ref_rect)
                     rkeys_by_page.setdefault(ref_page, []).append(rkey)
 
         # Determine is_current purely from current_rect_keys (order-independent)
@@ -1843,7 +1835,7 @@ class MainWindow(QMainWindow):
             for ref_page, ref_rect, _ in source_data:
                 if ref_page not in all_highlights_by_page:
                     all_highlights_by_page[ref_page] = []
-                all_highlights_by_page[ref_page].append((ref_rect, True))
+                all_highlights_by_page[ref_page].append((fitz.Rect(ref_rect), True))
 
         # Build the reference-navigation index (sorted page list + initial position)
         self._source_match_pages = sorted(all_highlights_by_page.keys())
