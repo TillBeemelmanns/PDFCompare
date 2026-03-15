@@ -5,7 +5,9 @@ Provides typed structures that replace ad-hoc dicts, ensuring consistent
 field presence across all creation and consumption sites.
 """
 
-from dataclasses import dataclass, field
+from __future__ import annotations
+
+from dataclasses import dataclass
 
 import fitz
 
