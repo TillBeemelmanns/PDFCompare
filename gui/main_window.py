@@ -8,6 +8,7 @@ This module provides the primary UI controller that integrates:
 - Modern dark theme styling
 """
 
+from bisect import bisect_right
 import os
 import psutil
 import fitz
@@ -107,6 +108,34 @@ class MainWindow(QMainWindow):
     - Rendering coordination via PDFRenderer
     - Theme application
     """
+
+    _PAGE_GAP = 10
+    _VIEW_ATTRS = {
+        "target": {
+            "scroll": "target_scroll",
+            "container": "target_container",
+            "renderer": "target_renderer",
+            "slots": "_page_slots",
+            "slot_data": "_page_slot_data",
+            "dims": "_target_page_dims",
+            "offsets": "_target_page_y_offsets",
+            "file": "_target_virtual_file",
+            "epoch": "_target_render_epoch",
+            "pending_worker": "_pending_bg_render_worker",
+        },
+        "source": {
+            "scroll": "source_scroll",
+            "container": "source_container",
+            "renderer": "source_renderer",
+            "slots": "_source_page_slots",
+            "slot_data": "_source_page_slot_data",
+            "dims": "_source_page_dims",
+            "offsets": "_source_page_y_offsets",
+            "file": "_source_virtual_file",
+            "epoch": "_source_render_epoch",
+            "pending_worker": "_pending_bg_source_worker",
+        },
+    }
 
     def __init__(self):
         super().__init__()
@@ -1038,42 +1067,188 @@ class MainWindow(QMainWindow):
         )
         self.lbl_stats_cache.setText(f"Cache: {total_cached} pages / {total_mb:.0f} MB")
 
+    def _view_get(self, view: str, key: str):
+        """Read a view-specific object or state field."""
+        return getattr(self, self._VIEW_ATTRS[view][key])
+
+    def _view_set(self, view: str, key: str, value) -> None:
+        """Write a view-specific object or state field."""
+        setattr(self, self._VIEW_ATTRS[view][key], value)
+
+    def _bump_view_render_epoch(self, view: str) -> int:
+        """Advance and return the render epoch for a view."""
+        epoch = self._view_get(view, "epoch") + 1
+        self._view_set(view, "epoch", epoch)
+        return epoch
+
+    def _is_current_render(self, view: str, file_path: str, render_epoch: int) -> bool:
+        """Return True only for callbacks belonging to the active render."""
+        return render_epoch == self._view_get(
+            view, "epoch"
+        ) and file_path == self._view_get(view, "file")
+
     def _is_current_target_render(self, file_path: str, render_epoch: int) -> bool:
         """Return True only for callbacks belonging to the active target render."""
-        return (
-            render_epoch == self._target_render_epoch
-            and file_path == self._target_virtual_file
-        )
+        return self._is_current_render("target", file_path, render_epoch)
 
     def _is_current_source_render(self, file_path: str, render_epoch: int) -> bool:
         """Return True only for callbacks belonging to the active source render."""
-        return (
-            render_epoch == self._source_render_epoch
-            and file_path == self._source_virtual_file
+        return self._is_current_render("source", file_path, render_epoch)
+
+    def _build_page_y_offsets(self, page_dims: list[tuple[int, int]]) -> list[int]:
+        """Compute the cumulative y offset for each page in a virtualized canvas."""
+        y_offsets: list[int] = []
+        y = 0
+        for _w, h in page_dims:
+            y_offsets.append(y)
+            y += int(h) + self._PAGE_GAP
+        return y_offsets
+
+    def _set_view_page_geometry(
+        self, view: str, page_dims: list[tuple[int, int]]
+    ) -> None:
+        """Store page dimensions, derived page offsets, and resize the canvas widget."""
+        self._view_set(view, "dims", page_dims)
+        self._view_set(view, "offsets", self._build_page_y_offsets(page_dims))
+        self._resize_view_container(view)
+
+    def _resize_view_container(self, view: str) -> None:
+        """Resize a virtualized canvas to cover all pages for the current view."""
+        page_dims = self._view_get(view, "dims")
+        container = self._view_get(view, "container")
+        y_offsets = self._view_get(view, "offsets")
+
+        total_h = (
+            int(y_offsets[-1] + page_dims[-1][1] + self._PAGE_GAP) if page_dims else 0
         )
+        max_w = max((int(w) for w, _h in page_dims), default=0)
+        container.setMinimumSize(max_w, total_h)
+        container.resize(max_w, total_h)
+
+    def _capture_scroll_anchor(
+        self, view: str, scroll_value: int | None = None
+    ) -> tuple[int, int] | None:
+        """Capture the top-of-viewport anchor as (page_idx, offset_from_page_top)."""
+        y_offsets = self._view_get(view, "offsets")
+        page_dims = self._view_get(view, "dims")
+        if not y_offsets or not page_dims:
+            return None
+
+        if scroll_value is None:
+            scroll_value = self._view_get(view, "scroll").verticalScrollBar().value()
+
+        page_idx = bisect_right(y_offsets, scroll_value) - 1
+        page_idx = max(0, min(page_idx, len(y_offsets) - 1))
+        page_top = int(y_offsets[page_idx])
+        max_offset = int(page_dims[page_idx][1]) + self._PAGE_GAP
+        offset = max(0, min(int(scroll_value - page_top), max_offset))
+        return page_idx, offset
+
+    def _scroll_value_from_anchor(
+        self, view: str, anchor: tuple[int, int] | None
+    ) -> int:
+        """Convert a stored page anchor back into a scrollbar value."""
+        y_offsets = self._view_get(view, "offsets")
+        page_dims = self._view_get(view, "dims")
+        if anchor is None or not y_offsets or not page_dims:
+            return 0
+
+        page_idx, offset = anchor
+        page_idx = max(0, min(int(page_idx), len(y_offsets) - 1))
+        max_offset = int(page_dims[page_idx][1]) + self._PAGE_GAP
+        offset = max(0, min(int(offset), max_offset))
+        return int(y_offsets[page_idx] + offset)
+
+    def _cancel_pending_worker(self, view: str) -> None:
+        """Cancel and clear any in-flight background page renderer for a view."""
+        worker = self._view_get(view, "pending_worker")
+        if worker is not None:
+            worker.cancel()
+            self._view_set(view, "pending_worker", None)
+
+    def _recycle_page_slots(self, view: str) -> None:
+        """Pool or delete all page widgets currently owned by a view."""
+        for lbl in self._view_get(view, "slots"):
+            if len(self.widget_pool) < self._MAX_POOL_SIZE:
+                lbl.setParent(None)
+                lbl.hide()
+                self.widget_pool.append(lbl)
+            else:
+                lbl.deleteLater()
+        self._view_set(view, "slots", [])
+        self._view_set(view, "slot_data", [])
+
+    def _get_render_zone(self, view: str) -> tuple[int, int]:
+        """Return the vertical buffer zone to materialize for the current viewport."""
+        scroll = self._view_get(view, "scroll")
+        viewport_height = scroll.viewport().height()
+        scroll_value = scroll.verticalScrollBar().value()
+        render_top = max(0, scroll_value - viewport_height)
+        render_bottom = scroll_value + 2 * viewport_height
+        return render_top, render_bottom
+
+    def _partition_pages_by_zone(
+        self, view: str, render_top: int, render_bottom: int
+    ) -> tuple[list[int], list[int]]:
+        """Split page indices into in-zone and out-of-zone groups."""
+        pages_in_zone: list[int] = []
+        pages_out_of_zone: list[int] = []
+
+        for page_idx, (y_off, (_w, h)) in enumerate(
+            zip(self._view_get(view, "offsets"), self._view_get(view, "dims"))
+        ):
+            if y_off + h >= render_top and y_off <= render_bottom:
+                pages_in_zone.append(page_idx)
+            else:
+                pages_out_of_zone.append(page_idx)
+
+        return pages_in_zone, pages_out_of_zone
+
+    def _update_visible_pages_if_current(
+        self, view: str, file_path: str, render_epoch: int
+    ) -> None:
+        """Run materialization only if the callback still belongs to this render."""
+        if self._is_current_render(view, file_path, render_epoch):
+            self._update_visible_pages(view)
+
+    def _restore_scroll_anchor_if_current(
+        self,
+        view: str,
+        anchor: tuple[int, int] | None,
+        file_path: str,
+        render_epoch: int,
+    ) -> None:
+        """Restore a view to its saved anchor only if the callback is still current."""
+        if not self._is_current_render(view, file_path, render_epoch):
+            return
+        scroll = self._view_get(view, "scroll")
+        scroll.verticalScrollBar().setValue(
+            self._scroll_value_from_anchor(view, anchor)
+        )
+        self._update_visible_pages(view)
 
     def _update_visible_target_pages_if_current(
         self, file_path: str, render_epoch: int
     ) -> None:
         """Run target materialization only if the callback still belongs to this render."""
-        if self._is_current_target_render(file_path, render_epoch):
-            self._update_visible_target_pages()
+        self._update_visible_pages_if_current("target", file_path, render_epoch)
 
     def _restore_target_scroll_if_current(
-        self, restore_scroll: int, file_path: str, render_epoch: int
+        self,
+        restore_anchor: tuple[int, int] | None,
+        file_path: str,
+        render_epoch: int,
     ) -> None:
-        """Restore the target scroll position only for the active render."""
-        if not self._is_current_target_render(file_path, render_epoch):
-            return
-        self.target_scroll.verticalScrollBar().setValue(restore_scroll)
-        self._update_visible_target_pages()
+        """Restore the target scroll anchor only for the active render."""
+        self._restore_scroll_anchor_if_current(
+            "target", restore_anchor, file_path, render_epoch
+        )
 
     def _update_visible_source_pages_if_current(
         self, file_path: str, render_epoch: int
     ) -> None:
         """Run source materialization only if the callback still belongs to this render."""
-        if self._is_current_source_render(file_path, render_epoch):
-            self._update_visible_source_pages()
+        self._update_visible_pages_if_current("source", file_path, render_epoch)
 
     def _scroll_source_if_current(
         self, scroll_y: int, file_path: str, render_epoch: int
@@ -1082,7 +1257,7 @@ class MainWindow(QMainWindow):
         if not self._is_current_source_render(file_path, render_epoch):
             return
         self.source_scroll.verticalScrollBar().setValue(scroll_y)
-        self._update_visible_source_pages()
+        self._update_visible_pages("source")
 
     def _set_source_text_cursor_if_current(
         self, cursor, file_path: str, render_epoch: int
@@ -1093,6 +1268,128 @@ class MainWindow(QMainWindow):
         self.source_text_edit.setTextCursor(cursor)
         self.source_text_edit.ensureCursorVisible()
 
+    def _start_background_render(self, view: str, page_indices: list[int]) -> None:
+        """Queue uncached pages for asynchronous rendering for a specific view."""
+        self._cancel_pending_worker(view)
+        render_epoch = self._view_get(view, "epoch")
+        file_path = self._view_get(view, "file")
+        worker = PageRenderWorker(file_path, page_indices, self.zoom_level)
+        worker.signals.finished.connect(
+            lambda results, zoom, worker=worker, view=view, file_path=file_path, render_epoch=render_epoch: (
+                self._handle_bg_pages_rendered(
+                    view, results, zoom, file_path, render_epoch, worker
+                )
+            )
+        )
+        self._view_set(view, "pending_worker", worker)
+        self._bg_render_pool.start(worker)
+
+    def _update_visible_pages(self, view: str) -> None:
+        """Materialize nearby pages and dematerialize distant pages for a view."""
+        if not self._view_get(view, "slots"):
+            return
+
+        render_top, render_bottom = self._get_render_zone(view)
+        pages_in_zone, pages_out_of_zone = self._partition_pages_by_zone(
+            view, render_top, render_bottom
+        )
+
+        renderer = self._view_get(view, "renderer")
+        file_path = self._view_get(view, "file")
+        zoom_key = round(self.zoom_level, 2)
+        cached_in_zone = [
+            page_idx
+            for page_idx in pages_in_zone
+            if renderer.pixmap_cache.get((file_path, page_idx, zoom_key)) is not None
+        ]
+        cached_set = set(cached_in_zone)
+        uncached_in_zone = [
+            page_idx for page_idx in pages_in_zone if page_idx not in cached_set
+        ]
+
+        for page_idx in cached_in_zone:
+            self._materialize_page(view, page_idx)
+
+        if uncached_in_zone:
+            self._start_background_render(view, uncached_in_zone)
+
+        for page_idx in pages_out_of_zone:
+            self._dematerialize_page(view, page_idx)
+
+    def _materialize_page(self, view: str, page_idx: int) -> None:
+        """Set the rendered pixmap on a page label and show it."""
+        slot_data = self._view_get(view, "slot_data")
+        if slot_data[page_idx]["materialized"]:
+            return
+
+        lbl = self._view_get(view, "slots")[page_idx]
+        pixmap = self._view_get(view, "renderer").get_cached_pixmap(
+            self._view_get(view, "file"), page_idx, self.zoom_level
+        )
+        lbl.original_pixmap = pixmap
+        lbl.move(0, int(self._view_get(view, "offsets")[page_idx]))
+        lbl.show()
+        if lbl.highlights:
+            lbl.draw_highlights()
+        else:
+            lbl.setPixmap(lbl.original_pixmap)
+        slot_data[page_idx]["materialized"] = True
+
+    def _dematerialize_page(self, view: str, page_idx: int) -> None:
+        """Hide a page and clear its pixmap to free RAM."""
+        slot_data = self._view_get(view, "slot_data")
+        if not slot_data[page_idx]["materialized"]:
+            return
+
+        lbl = self._view_get(view, "slots")[page_idx]
+        if lbl.hasFocus():
+            lbl.clearFocus()
+            self._view_get(view, "scroll").setFocus(Qt.FocusReason.OtherFocusReason)
+        lbl.hide()
+        lbl.original_pixmap = QPixmap()
+        lbl.setPixmap(QPixmap())
+        lbl._hl_cache = None
+        lbl._hl_cache_key = None
+        slot_data[page_idx]["materialized"] = False
+
+    def _handle_bg_pages_rendered(
+        self,
+        view: str,
+        results: list,
+        zoom: float,
+        file_path: str,
+        render_epoch: int,
+        worker: PageRenderWorker,
+    ) -> None:
+        """Convert rendered images to pixmaps, cache them, and materialize in-zone pages."""
+        if self._view_get(view, "pending_worker") is worker:
+            self._view_set(view, "pending_worker", None)
+
+        if (
+            not self._view_get(view, "slots")
+            or not self._is_current_render(view, file_path, render_epoch)
+            or zoom != round(self.zoom_level, 2)
+        ):
+            return
+
+        renderer = self._view_get(view, "renderer")
+        current_file = self._view_get(view, "file")
+        for page_idx, qimg in results:
+            renderer.store_pixmap(current_file, page_idx, zoom, QPixmap.fromImage(qimg))
+
+        render_top, render_bottom = self._get_render_zone(view)
+        slot_data = self._view_get(view, "slot_data")
+        y_offsets = self._view_get(view, "offsets")
+        page_dims = self._view_get(view, "dims")
+
+        for page_idx, _ in results:
+            if page_idx >= len(slot_data):
+                continue
+            y_off = y_offsets[page_idx]
+            _w, h = page_dims[page_idx]
+            if y_off + h >= render_top and y_off <= render_bottom:
+                self._materialize_page(view, page_idx)
+
     def render_target(self, file_path, results, restore_scroll=None):
         """
         Render target document using pixmap-swap lazy loading.
@@ -1101,41 +1398,24 @@ class MainWindow(QMainWindow):
         zero reflows during scroll). Materialization = set pixmap + draw highlights.
         Dematerialization = clear pixmap, releasing GPU/RAM for off-screen pages.
         """
-        # Cancel any in-flight background render so stale results don't arrive
-        if self._pending_bg_render_worker is not None:
-            self._pending_bg_render_worker.cancel()
-            self._pending_bg_render_worker = None
+        restore_anchor = (
+            self._capture_scroll_anchor("target", restore_scroll)
+            if restore_scroll is not None
+            else None
+        )
 
-        # Pool existing page widgets for reuse (capped to prevent memory bloat)
-        for lbl in self._page_slots:
-            if len(self.widget_pool) < self._MAX_POOL_SIZE:
-                lbl.setParent(None)
-                lbl.hide()
-                self.widget_pool.append(lbl)
-            else:
-                lbl.deleteLater()
-
-        self._page_slots = []
-        self._page_slot_data = []
+        self._cancel_pending_worker("target")
+        self._recycle_page_slots("target")
         self._target_virtual_file = file_path
         self._target_rendered_zoom = self.zoom_level
-        self._target_render_epoch += 1
-        render_epoch = self._target_render_epoch
+        render_epoch = self._bump_view_render_epoch("target")
 
         zoom = self.zoom_level
 
         # One fitz open to get page dimensions (for fixed sizes)
-        self._target_page_dims = self.target_renderer.get_page_dimensions(
-            file_path, zoom
-        )
-        n_pages = len(self._target_page_dims)
-
-        # Cumulative y-offsets for O(1) in-zone range checks during scroll
-        self._target_page_y_offsets = []
-        y = 0
-        for _w, h in self._target_page_dims:
-            self._target_page_y_offsets.append(y)
-            y += h + 10  # matches addSpacing(10)
+        page_dims = self.target_renderer.get_page_dimensions(file_path, zoom)
+        self._set_view_page_geometry("target", page_dims)
+        n_pages = len(page_dims)
 
         # Pre-render only the first visible page synchronously;
         # the background PageRenderWorker handles the rest without blocking.
@@ -1163,7 +1443,7 @@ class MainWindow(QMainWindow):
                         )
                     )
 
-            w_px, h_px = self._target_page_dims[page_idx]
+            w_px, h_px = page_dims[page_idx]
             if self.widget_pool:
                 lbl = self.widget_pool.pop()
                 try:
@@ -1200,25 +1480,14 @@ class MainWindow(QMainWindow):
                 {"highlights": highlights, "materialized": False}
             )
 
-        # Set container height so the scrollbar covers all pages
-        total_h = (
-            int(self._target_page_y_offsets[-1] + self._target_page_dims[-1][1] + 10)
-            if n_pages
-            else 0
-        )
-        max_w = max((int(w) for w, _h in self._target_page_dims), default=0)
-        self.target_container.setMinimumSize(max_w, total_h)
-        self.target_container.resize(max_w, total_h)
-
         # Let Qt finish the geometry pass, then materialize the visible pages.
-        # If a scroll position was saved before the layout drain, restore it first
-        # so the view doesn't jump to the top (or last widget) on refresh.
-        if restore_scroll is not None:
+        # If a scroll anchor was captured before the rebuild, restore it first.
+        if restore_anchor is not None:
             QTimer.singleShot(
                 0,
                 lambda file_path=file_path, render_epoch=render_epoch: (
                     self._restore_target_scroll_if_current(
-                        restore_scroll, file_path, render_epoch
+                        restore_anchor, file_path, render_epoch
                     )
                 ),
             )
@@ -1246,61 +1515,7 @@ class MainWindow(QMainWindow):
         Uncached pages are rendered off-thread by PageRenderWorker so the UI
         never blocks waiting for fitz rasterisation.
         """
-        if not self._page_slots:
-            return
-
-        viewport_height = self.target_scroll.viewport().height()
-        scroll_value = self.target_scroll.verticalScrollBar().value()
-
-        render_top = max(0, scroll_value - viewport_height)
-        render_bottom = scroll_value + 2 * viewport_height
-
-        pages_in_zone: list[int] = []
-        pages_out_of_zone: list[int] = []
-
-        for i, (y_off, (_w, h)) in enumerate(
-            zip(self._target_page_y_offsets, self._target_page_dims)
-        ):
-            if y_off + h >= render_top and y_off <= render_bottom:
-                pages_in_zone.append(i)
-            else:
-                pages_out_of_zone.append(i)
-
-        # Split in-zone pages into already-cached (instant) vs uncached (background)
-        zoom_key = round(self.zoom_level, 2)
-        cached_in_zone = [
-            i
-            for i in pages_in_zone
-            if self.target_renderer.pixmap_cache.get(
-                (self._target_virtual_file, i, zoom_key)
-            )
-            is not None
-        ]
-        uncached_in_zone = [i for i in pages_in_zone if i not in set(cached_in_zone)]
-
-        # Materialize cached pages right now — zero blocking work
-        for i in cached_in_zone:
-            self._materialize_target_page(i)
-
-        # Render uncached pages in a background thread
-        if uncached_in_zone:
-            if self._pending_bg_render_worker is not None:
-                self._pending_bg_render_worker.cancel()
-            render_epoch = self._target_render_epoch
-            file_path = self._target_virtual_file
-            worker = PageRenderWorker(file_path, uncached_in_zone, self.zoom_level)
-            worker.signals.finished.connect(
-                lambda results, zoom, worker=worker, file_path=file_path, render_epoch=render_epoch: (
-                    self._on_bg_pages_rendered(
-                        results, zoom, file_path, render_epoch, worker
-                    )
-                )
-            )
-            self._pending_bg_render_worker = worker
-            self._bg_render_pool.start(worker)
-
-        for i in pages_out_of_zone:
-            self._dematerialize_target_page(i)
+        self._update_visible_pages("target")
 
     def _on_bg_pages_rendered(
         self,
@@ -1311,68 +1526,17 @@ class MainWindow(QMainWindow):
         worker: PageRenderWorker,
     ) -> None:
         """Main-thread callback: convert QImages → QPixmaps, store, materialise."""
-        if self._pending_bg_render_worker is worker:
-            self._pending_bg_render_worker = None
-
-        # Discard if the view has since been rebuilt at a different zoom / file
-        if (
-            not self._page_slots
-            or not self._is_current_target_render(file_path, render_epoch)
-            or zoom != round(self.zoom_level, 2)
-        ):
-            return
-
-        for page_idx, qimg in results:
-            pixmap = QPixmap.fromImage(qimg)
-            self.target_renderer.store_pixmap(
-                self._target_virtual_file, page_idx, zoom, pixmap
-            )
-
-        # Materialise only pages still inside the visible buffer zone
-        viewport_height = self.target_scroll.viewport().height()
-        scroll_value = self.target_scroll.verticalScrollBar().value()
-        render_top = max(0, scroll_value - viewport_height)
-        render_bottom = scroll_value + 2 * viewport_height
-
-        for page_idx, _ in results:
-            if page_idx >= len(self._page_slot_data):
-                continue
-            y_off = self._target_page_y_offsets[page_idx]
-            _w, h = self._target_page_dims[page_idx]
-            if y_off + h >= render_top and y_off <= render_bottom:
-                self._materialize_target_page(page_idx)
+        self._handle_bg_pages_rendered(
+            "target", results, zoom, file_path, render_epoch, worker
+        )
 
     def _materialize_target_page(self, page_idx: int) -> None:
         """Set the rendered pixmap on the page's PDFPageLabel and show it."""
-        if self._page_slot_data[page_idx]["materialized"]:
-            return
-        lbl = self._page_slots[page_idx]
-        pixmap = self.target_renderer.get_cached_pixmap(
-            self._target_virtual_file, page_idx, self.zoom_level
-        )
-        lbl.original_pixmap = pixmap
-        lbl.move(0, int(self._target_page_y_offsets[page_idx]))
-        lbl.show()
-        if lbl.highlights:
-            lbl.draw_highlights()
-        else:
-            lbl.setPixmap(lbl.original_pixmap)
-        self._page_slot_data[page_idx]["materialized"] = True
+        self._materialize_page("target", page_idx)
 
     def _dematerialize_target_page(self, page_idx: int) -> None:
         """Hide the page and clear its pixmap to free RAM."""
-        if not self._page_slot_data[page_idx]["materialized"]:
-            return
-        lbl = self._page_slots[page_idx]
-        if lbl.hasFocus():
-            lbl.clearFocus()
-            self.target_scroll.setFocus(Qt.FocusReason.OtherFocusReason)
-        lbl.hide()
-        lbl.original_pixmap = QPixmap()
-        lbl.setPixmap(QPixmap())
-        lbl._hl_cache = None
-        lbl._hl_cache_key = None
-        self._page_slot_data[page_idx]["materialized"] = False
+        self._dematerialize_page("target", page_idx)
 
     def _on_source_scroll(self, value: int) -> None:
         """Called on every scroll-bar value change in the source view."""
@@ -1385,93 +1549,15 @@ class MainWindow(QMainWindow):
         Uncached pages are rendered off-thread by PageRenderWorker so the UI
         never blocks waiting for fitz rasterisation.
         """
-        if not self._source_page_slots:
-            return
-
-        viewport_height = self.source_scroll.viewport().height()
-        scroll_value = self.source_scroll.verticalScrollBar().value()
-
-        render_top = max(0, scroll_value - viewport_height)
-        render_bottom = scroll_value + 2 * viewport_height
-
-        pages_in_zone: list[int] = []
-        pages_out_of_zone: list[int] = []
-
-        for slot_idx, (y_off, (_w, h)) in enumerate(
-            zip(self._source_page_y_offsets, self._source_page_dims)
-        ):
-            if y_off + h >= render_top and y_off <= render_bottom:
-                pages_in_zone.append(slot_idx)
-            else:
-                pages_out_of_zone.append(slot_idx)
-
-        # Split in-zone pages into already-cached (instant) vs uncached (background)
-        zoom_key = round(self.zoom_level, 2)
-        cached_in_zone = [
-            i
-            for i in pages_in_zone
-            if self.source_renderer.pixmap_cache.get(
-                (self._source_virtual_file, i, zoom_key)
-            )
-            is not None
-        ]
-        uncached_in_zone = [i for i in pages_in_zone if i not in set(cached_in_zone)]
-
-        # Materialize cached pages right now — zero blocking work
-        for i in cached_in_zone:
-            self._materialize_source_page(i)
-
-        # Render uncached pages in a background thread
-        if uncached_in_zone:
-            if self._pending_bg_source_worker is not None:
-                self._pending_bg_source_worker.cancel()
-            render_epoch = self._source_render_epoch
-            file_path = self._source_virtual_file
-            worker = PageRenderWorker(file_path, uncached_in_zone, self.zoom_level)
-            worker.signals.finished.connect(
-                lambda results, zoom, worker=worker, file_path=file_path, render_epoch=render_epoch: (
-                    self._on_bg_source_pages_rendered(
-                        results, zoom, file_path, render_epoch, worker
-                    )
-                )
-            )
-            self._pending_bg_source_worker = worker
-            self._bg_render_pool.start(worker)
-
-        for i in pages_out_of_zone:
-            self._dematerialize_source_page(i)
+        self._update_visible_pages("source")
 
     def _materialize_source_page(self, slot_idx: int) -> None:
         """Set the rendered pixmap on the source page's label and show it."""
-        if self._source_page_slot_data[slot_idx]["materialized"]:
-            return
-        lbl = self._source_page_slots[slot_idx]
-        pixmap = self.source_renderer.get_cached_pixmap(
-            self._source_virtual_file, slot_idx, self.zoom_level
-        )
-        lbl.original_pixmap = pixmap
-        lbl.move(0, int(self._source_page_y_offsets[slot_idx]))
-        lbl.show()
-        if lbl.highlights:
-            lbl.draw_highlights()
-        else:
-            lbl.setPixmap(lbl.original_pixmap)
-        self._source_page_slot_data[slot_idx]["materialized"] = True
+        self._materialize_page("source", slot_idx)
 
     def _dematerialize_source_page(self, slot_idx: int) -> None:
         """Hide the source page and clear its pixmap to free RAM."""
-        if not self._source_page_slot_data[slot_idx]["materialized"]:
-            return
-        lbl = self._source_page_slots[slot_idx]
-        if lbl.hasFocus():
-            lbl.clearFocus()
-            self.source_scroll.setFocus(Qt.FocusReason.OtherFocusReason)
-        lbl.hide()
-        lbl.original_pixmap = QPixmap()
-        lbl.setPixmap(QPixmap())
-        lbl._hl_cache = None
-        lbl._hl_cache_key = None
-        self._source_page_slot_data[slot_idx]["materialized"] = False
+        self._dematerialize_page("source", slot_idx)
 
     def _on_bg_source_pages_rendered(
         self,
@@ -1482,36 +1568,9 @@ class MainWindow(QMainWindow):
         worker: PageRenderWorker,
     ) -> None:
         """Main-thread callback: convert QImages → QPixmaps, store, materialise."""
-        if self._pending_bg_source_worker is worker:
-            self._pending_bg_source_worker = None
-
-        # Discard if the view has since been rebuilt at a different zoom / file
-        if (
-            not self._source_page_slots
-            or not self._is_current_source_render(file_path, render_epoch)
-            or zoom != round(self.zoom_level, 2)
-        ):
-            return
-
-        for page_idx, qimg in results:
-            pixmap = QPixmap.fromImage(qimg)
-            self.source_renderer.store_pixmap(
-                self._source_virtual_file, page_idx, zoom, pixmap
-            )
-
-        # Materialise only pages still inside the visible buffer zone
-        viewport_height = self.source_scroll.viewport().height()
-        scroll_value = self.source_scroll.verticalScrollBar().value()
-        render_top = max(0, scroll_value - viewport_height)
-        render_bottom = scroll_value + 2 * viewport_height
-
-        for page_idx, _ in results:
-            if page_idx >= len(self._source_page_slot_data):
-                continue
-            y_off = self._source_page_y_offsets[page_idx]
-            _w, h = self._source_page_dims[page_idx]
-            if y_off + h >= render_top and y_off <= render_bottom:
-                self._materialize_source_page(page_idx)
+        self._handle_bg_pages_rendered(
+            "source", results, zoom, file_path, render_epoch, worker
+        )
 
     def clear_results(self):
         """Reset both viewers and all comparison state without clearing file lists."""
@@ -1794,11 +1853,8 @@ class MainWindow(QMainWindow):
                 f"Browsing reference: '{os.path.basename(file_path)}'", 3000
             )
 
-        self._source_render_epoch += 1
-        render_epoch = self._source_render_epoch
-        if self._pending_bg_source_worker is not None:
-            self._pending_bg_source_worker.cancel()
-            self._pending_bg_source_worker = None
+        render_epoch = self._bump_view_render_epoch("source")
+        self._cancel_pending_worker("source")
 
         should_rerender = (
             file_path != self.last_rendered_source
@@ -1809,33 +1865,18 @@ class MainWindow(QMainWindow):
             self.last_rendered_source = file_path
             self.last_rendered_zoom = self.zoom_level
 
-            # Pool existing source page widgets for reuse (capped)
-            for lbl in self._source_page_slots:
-                if len(self.widget_pool) < self._MAX_POOL_SIZE:
-                    lbl.setParent(None)
-                    lbl.hide()
-                    self.widget_pool.append(lbl)
-                else:
-                    lbl.deleteLater()
-
-            self._source_page_slots = []
-            self._source_page_slot_data = []
+            self._recycle_page_slots("source")
             self._source_virtual_file = file_path
-            self._source_render_epoch += 1
 
             doc = fitz.open(file_path)
             zoom = self.zoom_level
 
             # Match placeholder geometry to real pixmap sizes so scrolling stays stable.
-            self._source_page_dims = self.source_renderer.get_page_dimensions(
-                file_path, zoom, doc
+            page_dims = self.source_renderer.get_page_dimensions(file_path, zoom, doc)
+            self._set_view_page_geometry(
+                "source",
+                page_dims,
             )
-
-            self._source_page_y_offsets = []
-            y = 0
-            for _w, h in self._source_page_dims:
-                self._source_page_y_offsets.append(y)
-                y += h + 10
 
             # Pre-render only the scroll-target page (or page 0) synchronously;
             # the background PageRenderWorker handles the rest without blocking.
@@ -1846,7 +1887,7 @@ class MainWindow(QMainWindow):
 
             # Build all widgets with empty pixmaps + fixed sizes
             for page_idx, _page in enumerate(doc):
-                w_px, h_px = self._source_page_dims[page_idx]
+                w_px, h_px = page_dims[page_idx]
 
                 if self.widget_pool:
                     lbl = self.widget_pool.pop()
@@ -1886,17 +1927,6 @@ class MainWindow(QMainWindow):
             self._source_text_dirty = True
             if self.source_stack.currentIndex() == 1:
                 self._populate_source_text()
-
-            # Set container height so the scrollbar covers all pages
-            if self._source_page_dims:
-                total_h = int(
-                    self._source_page_y_offsets[-1] + self._source_page_dims[-1][1] + 10
-                )
-            else:
-                total_h = 0
-            max_w = max((int(w) for w, _h in self._source_page_dims), default=0)
-            self.source_container.setMinimumSize(max_w, total_h)
-            self.source_container.resize(max_w, total_h)
 
         # Build highlights for all matches from this source
         zoom = self.zoom_level

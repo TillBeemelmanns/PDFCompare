@@ -120,6 +120,25 @@ class TestTargetScrollRegression(unittest.TestCase):
 
         self.assertIsNone(self.window.target_renderer.pixmap_cache.get(cache_key))
 
+    def test_target_restore_uses_page_anchor_across_zoom(self):
+        self._render_target()
+
+        bar = self.window.target_scroll.verticalScrollBar()
+        bar.setValue(max(int(bar.maximum() * 0.45), 1))
+        self._wait(50)
+
+        expected_anchor = self.window._capture_scroll_anchor("target")
+        self.assertIsNotNone(expected_anchor)
+
+        self.window.zoom_level = 1.8
+        self.window.render_target(self.pdf_path, {}, restore_scroll=bar.value())
+
+        self.assertTrue(
+            self._wait_until(
+                lambda: self.window._capture_scroll_anchor("target") == expected_anchor
+            )
+        )
+
     def test_target_wheel_scroll_does_not_snap_back_during_async_render(self):
         original_run = PageRenderWorker.run
 
