@@ -676,7 +676,7 @@ class PDFPageLabel(QLabel):
 
         if matches_here:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.setFocus()  # Grab focus for key events
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
             mids = [m.match_id for m in matches_here]
 
             if self.show_hover_previews:
@@ -707,6 +707,8 @@ class PDFPageLabel(QLabel):
                 self.current_match_ids = []
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
+            if self.hasFocus():
+                self.clearFocus()
             if self._popup and self._popup.isVisible():
                 self._popup.hide()
             self.current_match_ids = []
@@ -729,6 +731,8 @@ class PDFPageLabel(QLabel):
             self._popup.hide()
         self.current_match_ids = []
         self._preview_request_ids = []
+        if self.hasFocus():
+            self.clearFocus()
         super().leaveEvent(event)
 
     def load_image_previews(self, matches):

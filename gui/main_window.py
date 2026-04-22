@@ -628,7 +628,7 @@ class MainWindow(QMainWindow):
 
         self.source_stack = QStackedWidget()
         self.source_scroll = QScrollArea()
-        self.source_scroll.setWidgetResizable(True)
+        self.source_scroll.setWidgetResizable(False)
         self.source_container = QWidget()
         self.source_scroll.setWidget(self.source_container)
         self.source_scroll.verticalScrollBar().valueChanged.connect(
@@ -722,7 +722,7 @@ class MainWindow(QMainWindow):
 
         right_content_hbox = QHBoxLayout()
         self.target_scroll = QScrollArea()
-        self.target_scroll.setWidgetResizable(True)
+        self.target_scroll.setWidgetResizable(False)
         self.target_container = QWidget()
         self.target_scroll.setWidget(self.target_container)
         right_content_hbox.addWidget(self.target_scroll)
@@ -1147,7 +1147,9 @@ class MainWindow(QMainWindow):
             if n_pages
             else 0
         )
-        self.target_container.setMinimumHeight(total_h)
+        max_w = max((int(w) for w, _h in self._target_page_dims), default=0)
+        self.target_container.setMinimumSize(max_w, total_h)
+        self.target_container.resize(max_w, total_h)
 
         # Let Qt finish the geometry pass, then materialize the visible pages.
         # If a scroll position was saved before the layout drain, restore it first
@@ -1263,7 +1265,6 @@ class MainWindow(QMainWindow):
             self._target_virtual_file, page_idx, self.zoom_level
         )
         lbl.original_pixmap = pixmap
-        lbl.setFixedSize(pixmap.width(), pixmap.height())
         lbl.move(0, int(self._target_page_y_offsets[page_idx]))
         lbl.show()
         if lbl.highlights:
@@ -1277,6 +1278,9 @@ class MainWindow(QMainWindow):
         if not self._page_slot_data[page_idx]["materialized"]:
             return
         lbl = self._page_slots[page_idx]
+        if lbl.hasFocus():
+            lbl.clearFocus()
+            self.target_scroll.setFocus(Qt.FocusReason.OtherFocusReason)
         lbl.hide()
         lbl.original_pixmap = QPixmap()
         lbl.setPixmap(QPixmap())
@@ -1354,7 +1358,6 @@ class MainWindow(QMainWindow):
             self._source_virtual_file, slot_idx, self.zoom_level
         )
         lbl.original_pixmap = pixmap
-        lbl.setFixedSize(pixmap.width(), pixmap.height())
         lbl.move(0, int(self._source_page_y_offsets[slot_idx]))
         lbl.show()
         if lbl.highlights:
@@ -1368,6 +1371,9 @@ class MainWindow(QMainWindow):
         if not self._source_page_slot_data[slot_idx]["materialized"]:
             return
         lbl = self._source_page_slots[slot_idx]
+        if lbl.hasFocus():
+            lbl.clearFocus()
+            self.source_scroll.setFocus(Qt.FocusReason.OtherFocusReason)
         lbl.hide()
         lbl.original_pixmap = QPixmap()
         lbl.setPixmap(QPixmap())
@@ -1430,12 +1436,14 @@ class MainWindow(QMainWindow):
         for lbl in self.widget_pool:
             lbl.deleteLater()
         self.widget_pool.clear()
-        self.target_container.setMinimumHeight(0)
+        self.target_container.setMinimumSize(0, 0)
+        self.target_container.resize(0, 0)
 
         # Delete all source page widgets
         for lbl in self._source_page_slots:
             lbl.deleteLater()
-        self.source_container.setMinimumHeight(0)
+        self.source_container.setMinimumSize(0, 0)
+        self.source_container.resize(0, 0)
 
         self._page_slots = []
         self._page_slot_data = []
@@ -1706,12 +1714,11 @@ class MainWindow(QMainWindow):
 
             doc = fitz.open(file_path)
             zoom = self.zoom_level
-            zoom_key = round(zoom, 2)
 
-            # Compute page dims from the already-open doc (avoids a second fitz.open)
-            self._source_page_dims = [
-                (p.rect.width * zoom_key, p.rect.height * zoom_key) for p in doc
-            ]
+            # Match placeholder geometry to real pixmap sizes so scrolling stays stable.
+            self._source_page_dims = self.source_renderer.get_page_dimensions(
+                file_path, zoom, doc
+            )
 
             self._source_page_y_offsets = []
             y = 0
@@ -1727,7 +1734,7 @@ class MainWindow(QMainWindow):
             self.source_renderer.batch_prerender(file_path, [first_page], zoom, doc)
 
             # Build all widgets with empty pixmaps + fixed sizes
-            for page_idx, page in enumerate(doc):
+            for page_idx, _page in enumerate(doc):
                 w_px, h_px = self._source_page_dims[page_idx]
 
                 if self.widget_pool:
@@ -1776,7 +1783,9 @@ class MainWindow(QMainWindow):
                 )
             else:
                 total_h = 0
-            self.source_container.setMinimumHeight(total_h)
+            max_w = max((int(w) for w, _h in self._source_page_dims), default=0)
+            self.source_container.setMinimumSize(max_w, total_h)
+            self.source_container.resize(max_w, total_h)
 
         # Build highlights for all matches from this source
         zoom = self.zoom_level

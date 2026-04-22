@@ -14,6 +14,13 @@ from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtCore import QObject, QTimer
 
 
+def _page_pixel_size(page, zoom: float) -> tuple[int, int]:
+    """Return the exact raster size PyMuPDF will produce for a page at *zoom*."""
+    zoom_key = round(zoom, 2)
+    irect = (page.rect * fitz.Matrix(zoom_key, zoom_key)).irect
+    return irect.width, irect.height
+
+
 class PixmapCache:
     """
     LRU cache for rendered PDF page pixmaps with memory-aware eviction.
@@ -162,7 +169,8 @@ class PDFRenderer(QObject):
         """Generate a QPixmap from a PDF page."""
         doc = self._get_doc(file_path)
         page = doc[page_idx]
-        mat = fitz.Matrix(zoom, zoom)
+        zoom_key = round(zoom, 2)
+        mat = fitz.Matrix(zoom_key, zoom_key)
         pix = page.get_pixmap(matrix=mat)
 
         qimg = QImage(
@@ -191,25 +199,21 @@ class PDFRenderer(QObject):
         self.pixmap_cache.clear()
 
     def get_page_dimensions(
-        self, file_path: str, zoom: float
-    ) -> list[tuple[float, float]]:
+        self, file_path: str, zoom: float, doc=None
+    ) -> list[tuple[int, int]]:
         """
         Open fitz once and return (width_px, height_px) for every page at the given zoom.
 
         Args:
             file_path: Path to the PDF file
             zoom: Zoom level (1.0 = 100%)
+            doc: Optional already-open fitz.Document to reuse
 
         Returns:
             List of (width_px, height_px) tuples for each page
         """
-        zoom_key = round(zoom, 2)
-        doc = self._get_doc(file_path)
-        dims = []
-        for page in doc:
-            rect = page.rect
-            dims.append((rect.width * zoom_key, rect.height * zoom_key))
-        return dims
+        doc = self._get_doc(file_path) if doc is None else doc
+        return [_page_pixel_size(page, zoom) for page in doc]
 
     def batch_prerender(
         self,
