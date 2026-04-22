@@ -146,6 +146,7 @@ class MainWindow(QMainWindow):
         self._target_page_y_offsets: list = []
         self._target_virtual_file: str = None
         self._target_rendered_zoom: float = 0.0  # zoom level of current page widgets
+        self._target_render_epoch: int = 0
 
         # Virtual scroll state — source view
         self._source_page_slots: list = []
@@ -153,6 +154,7 @@ class MainWindow(QMainWindow):
         self._source_page_dims: list = []
         self._source_page_y_offsets: list = []
         self._source_virtual_file: str = None
+        self._source_render_epoch: int = 0
 
         # Debounce timer — fires _do_refresh_target_view 150 ms after last call
         self._refresh_timer = QTimer()
@@ -1036,6 +1038,61 @@ class MainWindow(QMainWindow):
         )
         self.lbl_stats_cache.setText(f"Cache: {total_cached} pages / {total_mb:.0f} MB")
 
+    def _is_current_target_render(self, file_path: str, render_epoch: int) -> bool:
+        """Return True only for callbacks belonging to the active target render."""
+        return (
+            render_epoch == self._target_render_epoch
+            and file_path == self._target_virtual_file
+        )
+
+    def _is_current_source_render(self, file_path: str, render_epoch: int) -> bool:
+        """Return True only for callbacks belonging to the active source render."""
+        return (
+            render_epoch == self._source_render_epoch
+            and file_path == self._source_virtual_file
+        )
+
+    def _update_visible_target_pages_if_current(
+        self, file_path: str, render_epoch: int
+    ) -> None:
+        """Run target materialization only if the callback still belongs to this render."""
+        if self._is_current_target_render(file_path, render_epoch):
+            self._update_visible_target_pages()
+
+    def _restore_target_scroll_if_current(
+        self, restore_scroll: int, file_path: str, render_epoch: int
+    ) -> None:
+        """Restore the target scroll position only for the active render."""
+        if not self._is_current_target_render(file_path, render_epoch):
+            return
+        self.target_scroll.verticalScrollBar().setValue(restore_scroll)
+        self._update_visible_target_pages()
+
+    def _update_visible_source_pages_if_current(
+        self, file_path: str, render_epoch: int
+    ) -> None:
+        """Run source materialization only if the callback still belongs to this render."""
+        if self._is_current_source_render(file_path, render_epoch):
+            self._update_visible_source_pages()
+
+    def _scroll_source_if_current(
+        self, scroll_y: int, file_path: str, render_epoch: int
+    ) -> None:
+        """Restore source scroll only for the active render."""
+        if not self._is_current_source_render(file_path, render_epoch):
+            return
+        self.source_scroll.verticalScrollBar().setValue(scroll_y)
+        self._update_visible_source_pages()
+
+    def _set_source_text_cursor_if_current(
+        self, cursor, file_path: str, render_epoch: int
+    ) -> None:
+        """Update the source text cursor only if the callback is still current."""
+        if not self._is_current_source_render(file_path, render_epoch):
+            return
+        self.source_text_edit.setTextCursor(cursor)
+        self.source_text_edit.ensureCursorVisible()
+
     def render_target(self, file_path, results, restore_scroll=None):
         """
         Render target document using pixmap-swap lazy loading.
@@ -1062,6 +1119,8 @@ class MainWindow(QMainWindow):
         self._page_slot_data = []
         self._target_virtual_file = file_path
         self._target_rendered_zoom = self.zoom_level
+        self._target_render_epoch += 1
+        render_epoch = self._target_render_epoch
 
         zoom = self.zoom_level
 
@@ -1155,14 +1214,23 @@ class MainWindow(QMainWindow):
         # If a scroll position was saved before the layout drain, restore it first
         # so the view doesn't jump to the top (or last widget) on refresh.
         if restore_scroll is not None:
-
-            def _restore_and_materialize():
-                self.target_scroll.verticalScrollBar().setValue(restore_scroll)
-                self._update_visible_target_pages()
-
-            QTimer.singleShot(0, _restore_and_materialize)
+            QTimer.singleShot(
+                0,
+                lambda file_path=file_path, render_epoch=render_epoch: (
+                    self._restore_target_scroll_if_current(
+                        restore_scroll, file_path, render_epoch
+                    )
+                ),
+            )
         else:
-            QTimer.singleShot(0, self._update_visible_target_pages)
+            QTimer.singleShot(
+                0,
+                lambda file_path=file_path, render_epoch=render_epoch: (
+                    self._update_visible_target_pages_if_current(
+                        file_path, render_epoch
+                    )
+                ),
+            )
 
     def _on_target_scroll(self, value: int) -> None:
         """Called on every scroll-bar value change in the target view."""
@@ -1218,22 +1286,40 @@ class MainWindow(QMainWindow):
         if uncached_in_zone:
             if self._pending_bg_render_worker is not None:
                 self._pending_bg_render_worker.cancel()
-            worker = PageRenderWorker(
-                self._target_virtual_file, uncached_in_zone, self.zoom_level
+            render_epoch = self._target_render_epoch
+            file_path = self._target_virtual_file
+            worker = PageRenderWorker(file_path, uncached_in_zone, self.zoom_level)
+            worker.signals.finished.connect(
+                lambda results, zoom, worker=worker, file_path=file_path, render_epoch=render_epoch: (
+                    self._on_bg_pages_rendered(
+                        results, zoom, file_path, render_epoch, worker
+                    )
+                )
             )
-            worker.signals.finished.connect(self._on_bg_pages_rendered)
             self._pending_bg_render_worker = worker
             self._bg_render_pool.start(worker)
 
         for i in pages_out_of_zone:
             self._dematerialize_target_page(i)
 
-    def _on_bg_pages_rendered(self, results: list, zoom: float) -> None:
+    def _on_bg_pages_rendered(
+        self,
+        results: list,
+        zoom: float,
+        file_path: str,
+        render_epoch: int,
+        worker: PageRenderWorker,
+    ) -> None:
         """Main-thread callback: convert QImages → QPixmaps, store, materialise."""
-        self._pending_bg_render_worker = None
+        if self._pending_bg_render_worker is worker:
+            self._pending_bg_render_worker = None
 
         # Discard if the view has since been rebuilt at a different zoom / file
-        if not self._page_slots or zoom != round(self.zoom_level, 2):
+        if (
+            not self._page_slots
+            or not self._is_current_target_render(file_path, render_epoch)
+            or zoom != round(self.zoom_level, 2)
+        ):
             return
 
         for page_idx, qimg in results:
@@ -1339,10 +1425,16 @@ class MainWindow(QMainWindow):
         if uncached_in_zone:
             if self._pending_bg_source_worker is not None:
                 self._pending_bg_source_worker.cancel()
-            worker = PageRenderWorker(
-                self._source_virtual_file, uncached_in_zone, self.zoom_level
+            render_epoch = self._source_render_epoch
+            file_path = self._source_virtual_file
+            worker = PageRenderWorker(file_path, uncached_in_zone, self.zoom_level)
+            worker.signals.finished.connect(
+                lambda results, zoom, worker=worker, file_path=file_path, render_epoch=render_epoch: (
+                    self._on_bg_source_pages_rendered(
+                        results, zoom, file_path, render_epoch, worker
+                    )
+                )
             )
-            worker.signals.finished.connect(self._on_bg_source_pages_rendered)
             self._pending_bg_source_worker = worker
             self._bg_render_pool.start(worker)
 
@@ -1381,12 +1473,24 @@ class MainWindow(QMainWindow):
         lbl._hl_cache_key = None
         self._source_page_slot_data[slot_idx]["materialized"] = False
 
-    def _on_bg_source_pages_rendered(self, results: list, zoom: float) -> None:
+    def _on_bg_source_pages_rendered(
+        self,
+        results: list,
+        zoom: float,
+        file_path: str,
+        render_epoch: int,
+        worker: PageRenderWorker,
+    ) -> None:
         """Main-thread callback: convert QImages → QPixmaps, store, materialise."""
-        self._pending_bg_source_worker = None
+        if self._pending_bg_source_worker is worker:
+            self._pending_bg_source_worker = None
 
         # Discard if the view has since been rebuilt at a different zoom / file
-        if not self._source_page_slots or zoom != round(self.zoom_level, 2):
+        if (
+            not self._source_page_slots
+            or not self._is_current_source_render(file_path, render_epoch)
+            or zoom != round(self.zoom_level, 2)
+        ):
             return
 
         for page_idx, qimg in results:
@@ -1430,6 +1534,10 @@ class MainWindow(QMainWindow):
         self.ignored_match_ids = set()
         self.last_rendered_source = None
         self.last_rendered_zoom = None
+        self._target_render_epoch += 1
+        self._source_render_epoch += 1
+        self._target_virtual_file = None
+        self._source_virtual_file = None
         # Delete all target page widgets and discard pool
         for lbl in self._page_slots:
             lbl.deleteLater()
@@ -1686,16 +1794,18 @@ class MainWindow(QMainWindow):
                 f"Browsing reference: '{os.path.basename(file_path)}'", 3000
             )
 
+        self._source_render_epoch += 1
+        render_epoch = self._source_render_epoch
+        if self._pending_bg_source_worker is not None:
+            self._pending_bg_source_worker.cancel()
+            self._pending_bg_source_worker = None
+
         should_rerender = (
             file_path != self.last_rendered_source
             or self.zoom_level != self.last_rendered_zoom
         )
 
         if should_rerender:
-            if self._pending_bg_source_worker is not None:
-                self._pending_bg_source_worker.cancel()
-                self._pending_bg_source_worker = None
-
             self.last_rendered_source = file_path
             self.last_rendered_zoom = self.zoom_level
 
@@ -1711,6 +1821,7 @@ class MainWindow(QMainWindow):
             self._source_page_slots = []
             self._source_page_slot_data = []
             self._source_virtual_file = file_path
+            self._source_render_epoch += 1
 
             doc = fitz.open(file_path)
             zoom = self.zoom_level
@@ -1966,7 +2077,12 @@ class MainWindow(QMainWindow):
                 lbl.draw_highlights()
 
         # Materialize visible source pages (first load or after highlight refresh)
-        QTimer.singleShot(0, self._update_visible_source_pages)
+        QTimer.singleShot(
+            0,
+            lambda file_path=file_path, render_epoch=render_epoch: (
+                self._update_visible_source_pages_if_current(file_path, render_epoch)
+            ),
+        )
 
         # Text Edit Highlighting — only if text view has been populated
         if not getattr(self, "_source_text_dirty", True):
@@ -2000,8 +2116,7 @@ class MainWindow(QMainWindow):
             scroll_y = int(self._source_page_y_offsets[scroll_page])
 
             def _scroll_source():
-                self.source_scroll.verticalScrollBar().setValue(scroll_y)
-                self._update_visible_source_pages()
+                self._scroll_source_if_current(scroll_y, file_path, render_epoch)
 
             QTimer.singleShot(50, _scroll_source)
             if not getattr(self, "_source_text_dirty", True):
@@ -2009,10 +2124,12 @@ class MainWindow(QMainWindow):
                 cursor = self.source_text_edit.document().find(hdr_to_find)
                 if not cursor.isNull():
                     QTimer.singleShot(
-                        50, lambda: self.source_text_edit.setTextCursor(cursor)
-                    )
-                    QTimer.singleShot(
-                        50, lambda: self.source_text_edit.ensureCursorVisible()
+                        50,
+                        lambda cursor=cursor, file_path=file_path, render_epoch=render_epoch: (
+                            self._set_source_text_cursor_if_current(
+                                cursor, file_path, render_epoch
+                            )
+                        ),
                     )
 
         # Show/hide ◀▶ navigation buttons based on number of highlighted pages
