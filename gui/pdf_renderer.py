@@ -173,14 +173,18 @@ class PDFRenderer(QObject):
         mat = fitz.Matrix(zoom_key, zoom_key)
         pix = page.get_pixmap(matrix=mat)
 
+        # QImage wraps the fitz buffer without owning it. QPixmap.fromImage()
+        # deep-copies into a platform pixmap, so the buffer only needs to stay
+        # alive across that call — keeping `samples` (and `pix`) referenced here
+        # is enough, and lets us skip the otherwise-redundant QImage.copy().
+        samples = pix.samples
         qimg = QImage(
-            pix.samples,
+            samples,
             pix.width,
             pix.height,
             pix.stride,
             QImage.Format.Format_RGB888,
-        ).copy()  # Copy to own the data
-
+        )
         return QPixmap.fromImage(qimg)
 
     def invalidate_cache(self, file_path: Optional[str] = None) -> None:
