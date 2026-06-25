@@ -214,7 +214,7 @@ class PageRenderWorker(QRunnable):
     Background worker that rasterises a set of PDF pages into QImage objects.
 
     Uses QImage (thread-safe) rather than QPixmap; the caller converts to
-    QPixmap on the main thread via _on_bg_pages_rendered.
+    QPixmap on the main thread via VirtualPdfView.handle_bg_pages_rendered.
     """
 
     def __init__(self, file_path: str, page_indices: list, zoom: float):

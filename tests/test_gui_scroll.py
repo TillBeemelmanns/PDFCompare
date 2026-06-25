@@ -99,8 +99,8 @@ class TestTargetScrollRegression(unittest.TestCase):
     def test_stale_target_render_callback_is_ignored(self):
         self._render_target()
 
-        stale_epoch = self.window._target_render_epoch
-        stale_file = self.window._target_virtual_file
+        stale_epoch = self.window.target_view.render_epoch
+        stale_file = self.window.target_view.file
         page_idx = 10
         cache_key = (stale_file, page_idx, round(self.window.zoom_level, 2))
 
@@ -110,7 +110,7 @@ class TestTargetScrollRegression(unittest.TestCase):
         image = QImage(32, 32, QImage.Format.Format_RGB888)
         image.fill(0)
         stale_worker = PageRenderWorker(stale_file, [page_idx], self.window.zoom_level)
-        self.window._on_bg_pages_rendered(
+        self.window.target_view.handle_bg_pages_rendered(
             [(page_idx, image)],
             round(self.window.zoom_level, 2),
             stale_file,
@@ -127,7 +127,7 @@ class TestTargetScrollRegression(unittest.TestCase):
         bar.setValue(max(int(bar.maximum() * 0.45), 1))
         self._wait(50)
 
-        expected_anchor = self.window._capture_scroll_anchor("target")
+        expected_anchor = self.window.target_view.capture_scroll_anchor()
         self.assertIsNotNone(expected_anchor)
 
         self.window.zoom_level = 1.8
@@ -135,7 +135,9 @@ class TestTargetScrollRegression(unittest.TestCase):
 
         self.assertTrue(
             self._wait_until(
-                lambda: self.window._capture_scroll_anchor("target") == expected_anchor
+                lambda: (
+                    self.window.target_view.capture_scroll_anchor() == expected_anchor
+                )
             )
         )
 
@@ -174,7 +176,7 @@ class TestTargetScrollRegression(unittest.TestCase):
 
             self.assertTrue(
                 self._wait_until(
-                    lambda: self.window._pending_bg_render_worker is None,
+                    lambda: self.window.target_view.pending_worker is None,
                     timeout_ms=5000,
                 )
             )
