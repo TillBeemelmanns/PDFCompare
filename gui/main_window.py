@@ -1530,14 +1530,6 @@ class MainWindow(QMainWindow):
             "target", results, zoom, file_path, render_epoch, worker
         )
 
-    def _materialize_target_page(self, page_idx: int) -> None:
-        """Set the rendered pixmap on the page's PDFPageLabel and show it."""
-        self._materialize_page("target", page_idx)
-
-    def _dematerialize_target_page(self, page_idx: int) -> None:
-        """Hide the page and clear its pixmap to free RAM."""
-        self._dematerialize_page("target", page_idx)
-
     def _on_source_scroll(self, value: int) -> None:
         """Called on every scroll-bar value change in the source view."""
         self._source_scroll_timer.start()
@@ -1550,27 +1542,6 @@ class MainWindow(QMainWindow):
         never blocks waiting for fitz rasterisation.
         """
         self._update_visible_pages("source")
-
-    def _materialize_source_page(self, slot_idx: int) -> None:
-        """Set the rendered pixmap on the source page's label and show it."""
-        self._materialize_page("source", slot_idx)
-
-    def _dematerialize_source_page(self, slot_idx: int) -> None:
-        """Hide the source page and clear its pixmap to free RAM."""
-        self._dematerialize_page("source", slot_idx)
-
-    def _on_bg_source_pages_rendered(
-        self,
-        results: list,
-        zoom: float,
-        file_path: str,
-        render_epoch: int,
-        worker: PageRenderWorker,
-    ) -> None:
-        """Main-thread callback: convert QImages → QPixmaps, store, materialise."""
-        self._handle_bg_pages_rendered(
-            "source", results, zoom, file_path, render_epoch, worker
-        )
 
     def clear_results(self):
         """Reset both viewers and all comparison state without clearing file lists."""

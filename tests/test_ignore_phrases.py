@@ -75,6 +75,7 @@ class TestLoadIgnoredPhrases(unittest.TestCase):
         self._tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", delete=False, encoding="utf-8"
         )
+        self._tmp.close()
         self._path = self._tmp.name
         self._orig_path = compare_logic._IGNORE_PHRASES_FILE
         # Redirect the module-level constant to our temp file

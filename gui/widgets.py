@@ -364,6 +364,17 @@ class FileListWidget(QListWidget):
             painter.end()
 
 
+class ClickableLabel(QLabel):
+    """A QLabel that emits ``clicked`` on a left-button press."""
+
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class SourcePanelWidget(QWidget):
     selection_changed = pyqtSignal()
     file_browse_requested = pyqtSignal(str)  # emitted on filename-label click
@@ -451,15 +462,11 @@ class SourcePanelWidget(QWidget):
         top.addWidget(chk)
 
         # Clickable filename label — single click solos this file and opens it
-        name_lbl = QLabel(os.path.basename(fp))
+        name_lbl = ClickableLabel(os.path.basename(fp))
         name_lbl.setStyleSheet("font-size: 11px;")
         name_lbl.setToolTip(fp)
         name_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-        name_lbl.mousePressEvent = lambda event, _fp=fp: (
-            self._on_row_click(_fp)
-            if event.button() == Qt.MouseButton.LeftButton
-            else None
-        )
+        name_lbl.clicked.connect(lambda _fp=fp: self._on_row_click(_fp))
         top.addWidget(name_lbl, 1)
 
         stat = QLabel(f"{pct:.1f}% ({mc})")
@@ -570,8 +577,12 @@ class PDFPageLabel(QLabel):
 
     def __init__(self, pixmap, highlights, color_map):
         super().__init__()
-        self.original_pixmap = pixmap
-        self.highlights = highlights
+        # Monotonic version, bumped whenever `original_pixmap` or `highlights`
+        # is reassigned. Used as the highlight-cache key (see draw_highlights)
+        # so a recycled pool widget can never collide on a reused id().
+        self._content_version = 0
+        self._original_pixmap = pixmap
+        self._highlights = highlights
         self.color_map = color_map
         self.page_index = 0
         # Highlight-render cache: avoids redrawing when inputs haven't changed
@@ -587,6 +598,24 @@ class PDFPageLabel(QLabel):
         if PDFPageLabel._popup is None:
             PDFPageLabel._popup = PreviewPopup()
 
+    @property
+    def original_pixmap(self) -> QPixmap:
+        return self._original_pixmap
+
+    @original_pixmap.setter
+    def original_pixmap(self, value: QPixmap) -> None:
+        self._original_pixmap = value
+        self._content_version += 1
+
+    @property
+    def highlights(self) -> list:
+        return self._highlights
+
+    @highlights.setter
+    def highlights(self, value: list) -> None:
+        self._highlights = value
+        self._content_version += 1
+
     def draw_highlights(self):
         if not self.highlights or self.original_pixmap.isNull():
             self.setPixmap(self.original_pixmap)
@@ -595,10 +624,10 @@ class PDFPageLabel(QLabel):
             return
 
         # Return cached result when highlights, pixmap, intensity, or threshold
-        # have not changed since the last paint.
+        # have not changed since the last paint. _content_version monotonically
+        # tracks reassignment of highlights/original_pixmap (no id() reuse risk).
         cache_key = (
-            id(self.highlights),
-            id(self.original_pixmap),
+            self._content_version,
             PDFPageLabel.hl_intensity,
             PDFPageLabel.min_confidence,
         )

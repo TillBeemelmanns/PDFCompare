@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional, Callable
 import numpy as np
 
-import Levenshtein
+from rapidfuzz.distance import Levenshtein
 
 from models import HighlightEntry
 
@@ -266,9 +266,6 @@ class PDFComparator:
         self.merge_distance = 15
         self.max_workers = max_workers
 
-        # Pre-compute hash function for performance
-        self._hash = hash
-
     @staticmethod
     def _cache_key(file_path: str) -> str:
         stat = os.stat(file_path)
@@ -373,7 +370,7 @@ class PDFComparator:
         # reference_maps stores compact (page, (x0,y0,x1,y1), word) tuples.
         ref_map = [(parts, norm) for (_, norm, parts) in filtered_raw]
         gram_entries = [
-            (self._hash(gram), file_path, idx)
+            (hash(gram), file_path, idx)
             for idx, gram in self._generate_grams(filtered_raw, self.seed_size)
         ]
         word_entries = [
@@ -447,8 +444,15 @@ class PDFComparator:
         mismatch_penalty = -1
         gap_penalty = -1  # must be negative for the running-max trick to be valid
 
+        # Intern words to small integer IDs so the per-row comparison below runs
+        # as a vectorized C int-compare instead of a slow NumPy object-array
+        # (Python-string) comparison — the dominant cost of the inner loop.
+        vocab: dict[str, int] = {}
+        seq1_ids = [vocab.setdefault(w, len(vocab)) for w in seq1]
+        seq2_ids = [vocab.setdefault(w, len(vocab)) for w in seq2]
+
         score_matrix = np.zeros((m + 1, n + 1), dtype=np.int32)
-        seq2_arr = np.array(seq2)  # object array — element-wise string comparison
+        seq2_arr = np.fromiter(seq2_ids, dtype=np.int32, count=n)
         # 1-indexed column positions used by the left-gap formula
         j_idx = np.arange(1, n + 1, dtype=np.int32)
 
@@ -456,7 +460,7 @@ class PDFComparator:
         max_pos = (0, 0)
 
         for i in range(1, m + 1):
-            char = seq1[i - 1]
+            char = seq1_ids[i - 1]
 
             # Match/mismatch vector for every column j (vectorized)
             match_vals = np.where(
@@ -500,7 +504,7 @@ class PDFComparator:
         while i > 0 and j > 0 and score_matrix[i, j] > 0:
             score = int(score_matrix[i, j])
             score_diag = int(score_matrix[i - 1, j - 1])
-            is_match = seq1[i - 1] == seq2[j - 1]
+            is_match = seq1_ids[i - 1] == seq2_ids[j - 1]
             match = match_score if is_match else mismatch_penalty
 
             if score == score_diag + match or (is_match and score >= score_diag):
@@ -532,7 +536,7 @@ class PDFComparator:
 
         if mode == "fast":
             for filt_idx, gram in gram_chunk:
-                h = self._hash(gram)
+                h = hash(gram)
                 if h in self.reference_index:
                     for src_fp, src_idx in self.reference_index[h]:
                         matches.append(
@@ -564,7 +568,14 @@ class PDFComparator:
                                     for i in range(src_idx, src_idx + self.seed_size)
                                 ]
                             )
-                            if Levenshtein.distance(target_str, src_str) <= 5:
+                            # score_cutoff lets rapidfuzz abort the DP matrix early
+                            # once the edit distance is known to exceed the threshold.
+                            if (
+                                Levenshtein.distance(
+                                    target_str, src_str, score_cutoff=5
+                                )
+                                <= 5
+                            ):
                                 matches.append(
                                     {
                                         "target_filt_idx": filt_idx,
@@ -731,8 +742,11 @@ class PDFComparator:
             all_grams[i : i + chunk_size] for i in range(0, len(all_grams), chunk_size)
         ]
 
-        if len(chunks) > 1 and mode == "fast":
-            # Parallel matching for large documents
+        if len(chunks) > 1:
+            # Parallel matching for large documents. Both modes read only
+            # immutable shared state (reference_index, word_index,
+            # reference_maps), so no locking is needed — and fuzzy mode, being
+            # the heavier path, benefits the most from running concurrently.
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = [
                     executor.submit(self._match_gram_chunk, chunk, mode)
@@ -741,7 +755,7 @@ class PDFComparator:
                 for future in as_completed(futures):
                     raw_matches.extend(future.result())
         else:
-            # Sequential for small documents or fuzzy mode
+            # Sequential for small documents (single chunk)
             for chunk in chunks:
                 raw_matches.extend(self._match_gram_chunk(chunk, mode))
 
