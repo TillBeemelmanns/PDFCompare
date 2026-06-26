@@ -249,18 +249,21 @@ class PDFRenderer(QObject):
         should_close = doc is None
         if doc is None:
             doc = fitz.open(file_path)
+        mat = fitz.Matrix(zoom_key, zoom_key)
         try:
             for page_idx in uncached:
-                page = doc[page_idx]
-                mat = fitz.Matrix(zoom_key, zoom_key)
-                pix = page.get_pixmap(matrix=mat)
+                pix = doc[page_idx].get_pixmap(matrix=mat)
+                # QPixmap.fromImage() deep-copies, so the fitz buffer only needs
+                # to live across that call — keeping `samples` referenced lets us
+                # skip the redundant QImage.copy() (see _render_pixmap).
+                samples = pix.samples
                 qimg = QImage(
-                    pix.samples,
+                    samples,
                     pix.width,
                     pix.height,
                     pix.stride,
                     QImage.Format.Format_RGB888,
-                ).copy()
+                )
                 pixmap = QPixmap.fromImage(qimg)
                 self.pixmap_cache.put((file_path, page_idx, zoom_key), pixmap)
         finally:
