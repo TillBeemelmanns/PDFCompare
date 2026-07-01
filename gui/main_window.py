@@ -117,6 +117,14 @@ class MainWindow(QMainWindow):
         self.status_bar = self.statusBar()
         self.status_bar.showMessage("Ready. Drag and drop PDFs to start.")
 
+        # Permanent zoom indicator (right side of the status bar)
+        self.lbl_zoom_status = QLabel("Zoom 120%")
+        self.lbl_zoom_status.setStyleSheet("padding: 0 8px; font-size: 11px;")
+        self.lbl_zoom_status.setToolTip(
+            "Current zoom level. Ctrl+wheel or Ctrl+/− to zoom, Ctrl+0 to reset."
+        )
+        self.status_bar.addPermanentWidget(self.lbl_zoom_status)
+
         # Core components
         self.comparator = PDFComparator()
         self.target_renderer = PDFRenderer(max_bytes=256 * 1024 * 1024)  # 256 MB
@@ -173,7 +181,14 @@ class MainWindow(QMainWindow):
         self._bg_render_pool = QThreadPool()
         self._bg_render_pool.setMaxThreadCount(2)
 
+        self._comparison_running = False
+
         self.init_ui()
+
+        # Enable the Run button only when both file lists are populated.
+        self.reference_list.files_changed.connect(self._update_run_enabled)
+        self.target_list.files_changed.connect(self._update_run_enabled)
+        self._update_run_enabled()
 
         # Now that init_ui() has built the scroll areas + canvas containers,
         # wrap each viewer in its virtual-scroll engine.
@@ -238,7 +253,14 @@ class MainWindow(QMainWindow):
                 padding: 0 6px;
                 color: {Theme.LAVENDER};
             }}
-            QSpinBox, QComboBox {{
+            QToolTip {{
+                background-color: {Theme.SURFACE0};
+                color: {Theme.TEXT};
+                border: 1px solid {Theme.SURFACE2};
+                border-radius: 4px;
+                padding: 6px 8px;
+            }}
+            QSpinBox, QDoubleSpinBox, QComboBox {{
                 background-color: {Theme.SURFACE0};
                 border: 1px solid {Theme.SURFACE1};
                 border-radius: 6px;
@@ -246,11 +268,65 @@ class MainWindow(QMainWindow):
                 color: {Theme.TEXT};
                 min-height: 24px;
             }}
-            QSpinBox:hover, QComboBox:hover {{
+            QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {{
                 border-color: {Theme.MAUVE};
             }}
-            QSpinBox:focus, QComboBox:focus {{
+            QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
                 border-color: {Theme.LAVENDER};
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {Theme.SURFACE0};
+                color: {Theme.TEXT};
+                border: 1px solid {Theme.SURFACE1};
+                border-radius: 6px;
+                selection-background-color: {Theme.MAUVE};
+                selection-color: {Theme.CRUST};
+            }}
+            QLineEdit {{
+                background-color: {Theme.SURFACE0};
+                border: 1px solid {Theme.SURFACE1};
+                border-radius: 6px;
+                padding: 4px 8px;
+                color: {Theme.TEXT};
+                selection-background-color: {Theme.MAUVE};
+            }}
+            QLineEdit:hover {{
+                border-color: {Theme.MAUVE};
+            }}
+            QLineEdit:focus {{
+                border-color: {Theme.LAVENDER};
+            }}
+            QSlider::groove:horizontal {{
+                height: 4px;
+                background: {Theme.SURFACE1};
+                border-radius: 2px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {Theme.SURFACE2};
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                width: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+                background: {Theme.MAUVE};
+            }}
+            QSlider::handle:horizontal:hover {{
+                background: {Theme.LAVENDER};
+            }}
+            QMenu {{
+                background-color: {Theme.BASE};
+                border: 1px solid {Theme.SURFACE1};
+                border-radius: 6px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 6px 18px;
+                color: {Theme.TEXT};
+                border-radius: 4px;
+            }}
+            QMenu::item:selected {{
+                background-color: {Theme.SURFACE1};
             }}
             QPushButton {{
                 background-color: {Theme.SURFACE0};
@@ -310,6 +386,23 @@ class MainWindow(QMainWindow):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
                 height: 0px;
             }}
+            QScrollBar:horizontal {{
+                background-color: {Theme.MANTLE};
+                height: 12px;
+                border-radius: 6px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background-color: {Theme.SURFACE1};
+                border-radius: 5px;
+                min-width: 30px;
+                margin: 2px;
+            }}
+            QScrollBar::handle:horizontal:hover {{
+                background-color: {Theme.SURFACE2};
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                width: 0px;
+            }}
             QProgressBar {{
                 border: none;
                 border-radius: 6px;
@@ -342,6 +435,16 @@ class MainWindow(QMainWindow):
                 width: 3px;
             }}
         """)
+
+    @staticmethod
+    def _section_label(text: str) -> QLabel:
+        """Small uppercase section heading used above file lists."""
+        lbl = QLabel(text.upper())
+        lbl.setStyleSheet(
+            f"color: {Theme.OVERLAY1}; font-size: 10px;"
+            " font-weight: bold; letter-spacing: 1px;"
+        )
+        return lbl
 
     def init_ui(self):
         # Create the splitter as the primary layout element
@@ -451,7 +554,7 @@ class MainWindow(QMainWindow):
 
         row_ref_hdr = QHBoxLayout()
         row_ref_hdr.setContentsMargins(0, 0, 0, 0)
-        row_ref_hdr.addWidget(QLabel("Reference PDFs:"))
+        row_ref_hdr.addWidget(self._section_label("Reference PDFs"))
         row_ref_hdr.addStretch()
         btn_clr_ref = QPushButton("Clear")
         btn_clr_ref.setFixedHeight(22)
@@ -467,7 +570,7 @@ class MainWindow(QMainWindow):
 
         row_tgt_hdr = QHBoxLayout()
         row_tgt_hdr.setContentsMargins(0, 0, 0, 0)
-        row_tgt_hdr.addWidget(QLabel("Target PDF:"))
+        row_tgt_hdr.addWidget(self._section_label("Target PDF"))
         row_tgt_hdr.addStretch()
         btn_clr_tgt = QPushButton("Clear")
         btn_clr_tgt.setFixedHeight(22)
@@ -674,6 +777,19 @@ class MainWindow(QMainWindow):
         self.chk_minimap.stateChanged.connect(self._toggle_minimap)
         h_right_head.addWidget(self.chk_minimap)
 
+        h_right_head.addSpacing(10)
+        lbl_legend = QLabel(
+            '<span style="color:#f38ba8;">⬤</span> High similarity&nbsp;&nbsp;'
+            '<span style="color:#faaa1e;">⬤</span> Moderate'
+        )
+        lbl_legend.setStyleSheet(f"font-size: 10px; color: {Theme.SUBTEXT0};")
+        lbl_legend.setToolTip(
+            "Highlight color coding:\n"
+            "Red — high-confidence match (≥ 80%), near-verbatim text.\n"
+            "Amber — moderate-confidence match, partially similar text."
+        )
+        h_right_head.addWidget(lbl_legend)
+
         h_right_head.addStretch()
 
         # Highlight intensity slider (25 % – 200 %, default 100 %)
@@ -763,6 +879,7 @@ class MainWindow(QMainWindow):
         if new_zoom == self.zoom_level:
             return
         self.zoom_level = new_zoom
+        self.lbl_zoom_status.setText(f"Zoom {round(self.zoom_level * 100)}%")
         self.status_bar.showMessage(f"Zoom Level: {self.zoom_level:.1f}x", 2000)
         self.refresh_target_view()
         self.load_current_match()
@@ -939,11 +1056,24 @@ class MainWindow(QMainWindow):
                 else:
                     lbl.setPixmap(lbl.original_pixmap)
 
+    def _update_run_enabled(self) -> None:
+        """Enable Run only when both lists have files and no run is in flight."""
+        ready = bool(self.reference_list.get_files()) and bool(
+            self.target_list.get_files()
+        )
+        self.btn_run.setEnabled(ready and not self._comparison_running)
+        self.btn_run.setToolTip(
+            "Compare the target document against all references."
+            if ready
+            else "Add reference PDFs and a target PDF to enable."
+        )
+
     def _on_worker_error(self, title: str, message: str, thread: QThread) -> None:
         """Handle an error emitted by a background worker: stop thread, reset UI."""
         thread.quit()
         thread.wait()
-        self.btn_run.setEnabled(True)
+        self._comparison_running = False
+        self._update_run_enabled()
         self.progress_bar.setVisible(False)
         self.status_bar.showMessage(f"{title}: {message}", 10000)
         QMessageBox.critical(self, title, message)
@@ -954,6 +1084,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Files missing.")
             return
 
+        self._comparison_running = True
         self.btn_run.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 100)
@@ -1024,7 +1155,8 @@ class MainWindow(QMainWindow):
     def on_compare_finished(self, results, total_words, source_stats):
         self.compare_thread.quit()
         self.compare_thread.wait()
-        self.btn_run.setEnabled(True)
+        self._comparison_running = False
+        self._update_run_enabled()
         self.progress_bar.setVisible(False)
 
         self.current_results = results

@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMenu,
     QProgressBar,
     QScrollArea,
@@ -339,8 +340,28 @@ class FileListWidget(QListWidget):
                 self._show_invalid_feedback()
                 event.ignore()
 
+    def addItem(self, item) -> None:
+        """Display the basename with a 📄 marker; keep the full path in
+        UserRole data and the tooltip. Emits files_changed."""
+        if isinstance(item, str):
+            list_item = QListWidgetItem(f"📄  {os.path.basename(item)}")
+            list_item.setData(Qt.ItemDataRole.UserRole, item)
+            list_item.setToolTip(item)
+            super().addItem(list_item)
+            self.files_changed.emit()
+        else:
+            super().addItem(item)
+
+    def clear(self) -> None:
+        super().clear()
+        self.files_changed.emit()
+
     def get_files(self):
-        return [self.item(i).text() for i in range(self.count())]
+        files = []
+        for i in range(self.count()):
+            it = self.item(i)
+            files.append(it.data(Qt.ItemDataRole.UserRole) or it.text())
+        return files
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         """Double-click opens a file browser as an alternative to drag-and-drop."""
