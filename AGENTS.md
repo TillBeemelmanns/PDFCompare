@@ -56,7 +56,7 @@
    - Catppuccin dark theme.
    - Animated drag-and-drop with visual feedback.
    - Cache and memory statistics always visible.
-   - Intuitive navigation (Space / click to cycle overlapping matches, mouse side buttons, MiniMap).
+   - Intuitive navigation (re-click a target highlight to cycle through all reference occurrences of that phrase via `alt_matches`; ◀▶ buttons step through match blocks with gold current-match stamping; Space / mouse side buttons cycle hover previews; MiniMap).
 
 ## Workflow Mandates
 

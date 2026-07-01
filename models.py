@@ -57,3 +57,8 @@ class HighlightEntry:
     """Override file path for hover previews. When set, the ``PreviewWorker``
     opens this file instead of ``source``. Used by reference-viewer highlights
     to point previews at the target document."""
+
+    alt_matches: list | None = None
+    """Alternate reference occurrences of this match's phrase: list of
+    ``{"source", "source_data", "confidence"}`` dicts, best-first. Repeated
+    clicks on the same target highlight cycle through these locations."""

@@ -373,8 +373,11 @@ class PDFComparator:
             (hash(gram), file_path, idx)
             for idx, gram in self._generate_grams(filtered_raw, self.seed_size)
         ]
+        # NOTE: fuzzy matching indexes into ref_map (filtered positions), so the
+        # word index must store the *filtered* position — not the original
+        # pre-filter index carried inside each filtered_raw tuple.
         word_entries = [
-            (norm_word, file_path, idx) for idx, norm_word, _ in filtered_raw
+            (norm, file_path, pos) for pos, (_, norm, _) in enumerate(filtered_raw)
         ]
         return file_path, ref_map, gram_entries, word_entries
 
@@ -762,48 +765,54 @@ class PDFComparator:
         if progress_callback:
             progress_callback(40, "Merging match blocks...")
 
-        # Sort and merge matches
+        # Sort and merge matches into blocks. Multiple chains are kept open in
+        # parallel: when the same target phrase matches several locations in a
+        # reference (repeated boilerplate, duplicated sentences), the raw
+        # matches interleave — one open chain per source occurrence keeps each
+        # occurrence a clean contiguous block instead of fragmenting them all.
         raw_matches.sort(key=lambda x: (x["src_file"], x["target_filt_idx"]))
 
         merged_blocks = []
-        if raw_matches:
-            curr = None
-            for m in raw_matches:
-                if curr is None:
-                    curr = {
-                        "src": m["src_file"],
-                        "start": m["target_filt_idx"],
-                        "end": m["target_filt_idx"] + self.seed_size,
-                        "last_src_idx": m["src_filt_idx"],
-                        "src_start_idx": m["src_filt_idx"],
-                    }
-                    continue
+        open_chains: list[dict] = []
+        for m in raw_matches:
+            tfi = m["target_filt_idx"]
 
-                dist = m["target_filt_idx"] - curr["end"]
-                gap_t = m["target_filt_idx"] - (curr["end"] - self.seed_size)
-                gap_s = m["src_filt_idx"] - curr["last_src_idx"]
-
+            # Close chains this match can no longer extend (different file, or
+            # target gap exceeded — tfi is non-decreasing within a file).
+            still_open = []
+            for chain in open_chains:
                 if (
-                    m["src_file"] == curr["src"]
-                    and dist <= self.merge_distance
-                    and dist >= -self.seed_size
-                    and abs(gap_t - gap_s) <= 5
+                    chain["src"] != m["src_file"]
+                    or tfi - chain["end"] > self.merge_distance
                 ):
-                    curr["end"] = max(
-                        curr["end"], m["target_filt_idx"] + self.seed_size
-                    )
-                    curr["last_src_idx"] = m["src_filt_idx"]
+                    merged_blocks.append(chain)
                 else:
-                    merged_blocks.append(curr)
-                    curr = {
+                    still_open.append(chain)
+            open_chains = still_open
+
+            extended = None
+            for chain in open_chains:
+                dist = tfi - chain["end"]
+                gap_t = tfi - (chain["end"] - self.seed_size)
+                gap_s = m["src_filt_idx"] - chain["last_src_idx"]
+                if dist >= -self.seed_size and abs(gap_t - gap_s) <= 5:
+                    extended = chain
+                    break
+
+            if extended is not None:
+                extended["end"] = max(extended["end"], tfi + self.seed_size)
+                extended["last_src_idx"] = m["src_filt_idx"]
+            else:
+                open_chains.append(
+                    {
                         "src": m["src_file"],
-                        "start": m["target_filt_idx"],
-                        "end": m["target_filt_idx"] + self.seed_size,
+                        "start": tfi,
+                        "end": tfi + self.seed_size,
                         "last_src_idx": m["src_filt_idx"],
                         "src_start_idx": m["src_filt_idx"],
                     }
-            if curr:
-                merged_blocks.append(curr)
+                )
+        merged_blocks.extend(open_chains)
 
         if progress_callback:
             progress_callback(60, "Refining matches...")
@@ -813,10 +822,12 @@ class PDFComparator:
         # array work and achieve genuine concurrency.
         source_word_counts = defaultdict(set)
         best_match_per_word: dict[int, dict] = {}
+        block_results: list[tuple] = []
 
         ignored_phrases = load_ignored_phrases()
         total_blocks = len(merged_blocks)
         completed = 0
+        last_percent = -1
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {
@@ -835,11 +846,16 @@ class PDFComparator:
                 completed += 1
                 if progress_callback and total_blocks > 0:
                     percent = 60 + int((completed / total_blocks) * 35)
-                    progress_callback(
-                        percent, f"Processing block {completed}/{total_blocks}"
-                    )
+                    # Emit only on percent change — one cross-thread signal per
+                    # block floods the Qt event loop on large documents.
+                    if percent != last_percent:
+                        last_percent = percent
+                        progress_callback(
+                            percent, f"Processing block {completed}/{total_blocks}"
+                        )
                 if result is None:
                     continue
+                block_results.append(result)
                 src, valid_indices, confidence, match_density, source_info, match_id = (
                     result
                 )
@@ -858,6 +874,44 @@ class PDFComparator:
                             "match_density": match_density,
                         }
 
+        # Alternate occurrences: for each block, every other block that covers
+        # at least half of its target words points at another reference
+        # location of (essentially) the same phrase. The GUI cycles through
+        # these on repeated clicks so all plagiarism sources can be inspected.
+        word_to_block_idxs: dict[int, list[int]] = defaultdict(list)
+        for k, res in enumerate(block_results):
+            for i in res[1]:
+                word_to_block_idxs[i].append(k)
+
+        alt_matches_by_block: dict[int, list] = {}
+        for k, res in enumerate(block_results):
+            _, valid_indices, _, _, _, match_id = res
+            overlap_counts: dict[int, int] = defaultdict(int)
+            for i in valid_indices:
+                for other in word_to_block_idxs[i]:
+                    if other != k:
+                        overlap_counts[other] += 1
+
+            min_overlap = max(self.seed_size, len(valid_indices) // 2)
+            alts = []
+            seen_locations = set()
+            for other, count in sorted(
+                overlap_counts.items(), key=lambda kv: -block_results[kv[0]][2]
+            ):
+                if count < min_overlap:
+                    continue
+                o_src, _, o_conf, _, o_info, _ = block_results[other]
+                # Dedup near-identical reference locations (same file + start rect)
+                location = (o_src, o_info[0][:2] if o_info else None)
+                if location in seen_locations:
+                    continue
+                seen_locations.add(location)
+                alts.append(
+                    {"source": o_src, "source_data": o_info, "confidence": o_conf}
+                )
+            if alts:
+                alt_matches_by_block[match_id] = alts
+
         # Build final highlight list — one rect per target word (no alpha stacking)
         final_highlights: dict = defaultdict(list)
         for i, best in best_match_per_word.items():
@@ -871,6 +925,7 @@ class PDFComparator:
                         match_id=best["match_id"],
                         confidence=best["confidence"],
                         match_density=best.get("match_density", 0.0),
+                        alt_matches=alt_matches_by_block.get(best["match_id"]),
                     )
                 )
 

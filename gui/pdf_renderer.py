@@ -63,8 +63,9 @@ class PixmapCache:
     def put(self, key: tuple, pixmap: QPixmap) -> None:
         """Store a pixmap, evicting LRU entries until under the byte budget."""
         if key in self._cache:
-            self._cache.move_to_end(key)
-            return
+            # Replace rather than keep the stale pixmap for this key
+            self._used_bytes -= self._pixmap_bytes(self._cache[key])
+            del self._cache[key]
 
         size = self._pixmap_bytes(pixmap)
         # Always keep at least one entry even if it exceeds the budget alone

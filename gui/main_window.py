@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
     QSlider,
 )
 from PyQt6.QtGui import QColor, QPalette, QPixmap
-from PyQt6.QtCore import Qt, QThread, QTimer, QThreadPool
+from PyQt6.QtCore import Qt, QEvent, QThread, QTimer, QThreadPool
 
 from compare_logic import (
     PDFComparator,
@@ -135,10 +135,17 @@ class MainWindow(QMainWindow):
         self.widget_pool = []  # Pool for PDFPageLabel reuse
         self._MAX_POOL_SIZE = 50  # Cap to prevent unbounded memory growth
 
-        # Reference-viewer navigation: sorted list of reference page indices that
-        # have highlight marks; _source_match_page_idx is the current position.
-        self._source_match_pages: list = []
-        self._source_match_page_idx: int = 0
+        # Reference-viewer navigation: match blocks from the current source file,
+        # ordered by position in the reference document. _source_nav_index is the
+        # active block; _source_nav_data caches what highlight re-stamping needs.
+        self._source_match_blocks: list = []
+        self._source_nav_index: int = 0
+        self._source_nav_data: dict | None = None
+
+        # Occurrence cycling: repeated clicks on the same target highlight step
+        # through all reference locations of that phrase (primary + alternates).
+        self._match_occurrences: list = []
+        self._occurrence_index: int = 0
 
         # Per-viewer virtual-scroll engines are created after init_ui() builds
         # the scroll areas and containers they wrap (see below).
@@ -654,9 +661,13 @@ class MainWindow(QMainWindow):
 
         h_right_head = QHBoxLayout()
         h_right_head.setContentsMargins(0, 0, 0, 0)
-        h_right_head.addWidget(
-            QLabel("<b>Target Document</b> (Click highlights to trace)")
+        lbl_target_hdr = QLabel("<b>Target Document</b> (Click highlights to trace)")
+        lbl_target_hdr.setToolTip(
+            "Click a highlight to jump to its source in the reference viewer.\n"
+            "Click the same highlight again to cycle through all other\n"
+            "occurrences of that phrase in the references."
         )
+        h_right_head.addWidget(lbl_target_hdr)
 
         self.chk_minimap = QCheckBox("Map")
         self.chk_minimap.setChecked(True)
@@ -734,6 +745,11 @@ class MainWindow(QMainWindow):
             self._on_target_scroll
         )
 
+        # Ctrl+wheel zoom must be intercepted at the viewports — the scroll
+        # areas consume wheel events before they ever reach MainWindow.
+        self.target_scroll.viewport().installEventFilter(self)
+        self.source_scroll.viewport().installEventFilter(self)
+
         # Add panels to splitter
         splitter.addWidget(left_panel)
         splitter.addWidget(middle_wrapper)
@@ -743,10 +759,28 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(2, 2)
 
     def change_zoom(self, delta):
-        self.zoom_level = max(0.5, min(3.0, self.zoom_level + delta))
+        new_zoom = max(0.5, min(3.0, self.zoom_level + delta))
+        if new_zoom == self.zoom_level:
+            return
+        self.zoom_level = new_zoom
         self.status_bar.showMessage(f"Zoom Level: {self.zoom_level:.1f}x", 2000)
         self.refresh_target_view()
         self.load_current_match()
+
+    def reset_zoom(self):
+        self.change_zoom(1.2 - self.zoom_level)
+
+    def eventFilter(self, obj, event):
+        """Ctrl+wheel over either PDF viewport zooms instead of scrolling."""
+        if (
+            event.type() == QEvent.Type.Wheel
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            delta = event.angleDelta().y()
+            if delta:
+                self.change_zoom(0.1 if delta > 0 else -0.1)
+            return True
+        return super().eventFilter(obj, event)
 
     def scroll_target_to_percent(self, percent):
         bar = self.target_scroll.verticalScrollBar()
@@ -1026,7 +1060,7 @@ class MainWindow(QMainWindow):
             f"Memory: {self.process.memory_info().rss / 1024 / 1024:.1f} MB"
         )
         self.lbl_stats_ngrams.setText(
-            f"Indexed N-Grams: {self.comparator.get_stats()['total_ngrams']}"
+            f"N-Grams: {self.comparator.get_stats()['total_ngrams']:,}"
         )
         cache_stats = self.target_renderer.get_cache_stats()
         source_cache_stats = self.source_renderer.get_cache_stats()
@@ -1045,6 +1079,26 @@ class MainWindow(QMainWindow):
         self.source_text_edit.setTextCursor(cursor)
         self.source_text_edit.ensureCursorVisible()
 
+    def _checkout_page_label(self, highlights: list) -> PDFPageLabel:
+        """Take a recycled PDFPageLabel from the pool (or create one) reset to
+        a clean state: no pixmap, no signal connections, no cached highlights."""
+        if not self.widget_pool:
+            return PDFPageLabel(QPixmap(), highlights, {})
+
+        lbl = self.widget_pool.pop()
+        for signal in (lbl.matchesClicked, lbl.matchIgnored, lbl.matchPhraseIgnored):
+            try:
+                signal.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+        lbl.original_pixmap = QPixmap()
+        lbl.highlights = highlights
+        lbl.color_map = {}
+        lbl.setPixmap(QPixmap())
+        lbl._hl_cache = None
+        lbl._hl_cache_key = None
+        return lbl
+
     def render_target(self, file_path, results, restore_scroll=None):
         """
         Render target document using pixmap-swap lazy loading.
@@ -1059,6 +1113,17 @@ class MainWindow(QMainWindow):
             if restore_scroll is not None
             else None
         )
+        # The anchor offset is in old-zoom pixels; rescale it so zooming keeps
+        # the same document position at the top of the viewport.
+        old_zoom = view.rendered_zoom
+        if (
+            restore_anchor is not None
+            and view.file == file_path
+            and old_zoom
+            and old_zoom != self.zoom_level
+        ):
+            page_idx, offset = restore_anchor
+            restore_anchor = (page_idx, int(offset * self.zoom_level / old_zoom))
 
         view.cancel_pending_worker()
         view.recycle_page_slots()
@@ -1100,26 +1165,7 @@ class MainWindow(QMainWindow):
                     )
 
             w_px, h_px = page_dims[page_idx]
-            if self.widget_pool:
-                lbl = self.widget_pool.pop()
-                try:
-                    lbl.matchesClicked.disconnect()
-                except (TypeError, RuntimeError):
-                    pass
-                try:
-                    lbl.matchIgnored.disconnect()
-                except (TypeError, RuntimeError):
-                    pass
-                try:
-                    lbl.matchPhraseIgnored.disconnect()
-                except (TypeError, RuntimeError):
-                    pass
-                lbl.original_pixmap = QPixmap()
-                lbl.highlights = highlights
-                lbl.color_map = {}
-                lbl.setPixmap(QPixmap())
-            else:
-                lbl = PDFPageLabel(QPixmap(), highlights, {})
+            lbl = self._checkout_page_label(highlights)
 
             lbl.page_index = page_idx
             lbl.matchesClicked.connect(self.handle_matches_clicked)
@@ -1184,8 +1230,11 @@ class MainWindow(QMainWindow):
         self.current_target_file = None
         self.current_match_list = []
         self.current_match_index = 0
-        self._source_match_pages = []
-        self._source_match_page_idx = 0
+        self._source_match_blocks = []
+        self._source_nav_index = 0
+        self._source_nav_data = None
+        self._match_occurrences = []
+        self._occurrence_index = 0
         self.ignored_match_ids = set()
         self.last_rendered_source = None
         self.last_rendered_zoom = None
@@ -1343,6 +1392,12 @@ class MainWindow(QMainWindow):
                     self.source_container.setMinimumHeight(0)
                     self.lbl_source_title.setText("<b>Matched Reference Viewer</b>")
                     self.current_match_list = []
+                    self._source_match_blocks = []
+                    self._source_nav_index = 0
+                    self._source_nav_data = None
+                    self._match_occurrences = []
+                    self._occurrence_index = 0
+                    self.update_match_controls()
 
     def handle_matches_clicked(self, matches):
         current_ids = [m.match_id for m in matches]
@@ -1352,60 +1407,86 @@ class MainWindow(QMainWindow):
             else []
         )
         if current_ids == last_ids:
-            # Same spot re-clicked: advance to the next highlighted page in the
-            # reference viewer (cycles through all matches from that source file).
-            self.next_match()
+            # Same spot re-clicked: cycle through the other reference locations
+            # where this same phrase occurs (alternate occurrences).
+            self._cycle_match_occurrence()
         else:
             self.current_match_list = matches
             self.current_match_index = 0
+            primary = matches[0]
+            # Occurrence ring for this phrase: best match first, alternates after.
+            self._match_occurrences = [
+                {"source": primary.source, "source_data": primary.source_data}
+            ] + [
+                {"source": a["source"], "source_data": a["source_data"]}
+                for a in (primary.alt_matches or [])
+            ]
+            self._occurrence_index = 0
             self.load_current_match()
 
+    def _cycle_match_occurrence(self):
+        """Jump the reference viewer to the next occurrence of the clicked phrase."""
+        occurrences = self._match_occurrences
+        n = len(occurrences)
+        if n <= 1:
+            self.status_bar.showMessage(
+                "No other occurrences of this phrase in the references.", 3000
+            )
+            return
+        self._occurrence_index = (self._occurrence_index + 1) % n
+        occ = occurrences[self._occurrence_index]
+        self.load_source_view(occ["source"], occ["source_data"])
+        self.status_bar.showMessage(
+            f"Occurrence {self._occurrence_index + 1} of {n} for this phrase"
+            f" — '{os.path.basename(occ['source'])}'",
+            4000,
+        )
+
     def update_match_controls(self):
-        """Show/hide ◀▶ navigation based on how many reference pages are highlighted."""
-        n = len(self._source_match_pages)
+        """Show/hide ◀▶ navigation based on how many match blocks are navigable."""
+        n = len(self._source_match_blocks)
         if n > 1:
             self.btn_prev_match.setVisible(True)
             self.btn_next_match.setVisible(True)
             self.lbl_match_counter.setVisible(True)
-            self.lbl_match_counter.setText(
-                f"Match {self._source_match_page_idx + 1} of {n}"
-            )
+            self.lbl_match_counter.setText(f"Match {self._source_nav_index + 1} of {n}")
         else:
             self.btn_prev_match.setVisible(False)
             self.btn_next_match.setVisible(False)
             self.lbl_match_counter.setVisible(False)
 
-    def _scroll_to_source_match(self):
-        """Scroll the reference viewer to _source_match_pages[_source_match_page_idx]."""
-        if not self._source_match_pages or not self.source_view.slots:
+    def _source_block_scroll_y(self, block: dict) -> int | None:
+        """Scroll offset that puts a match block's top rect comfortably in view."""
+        view = self.source_view
+        if block["page"] >= len(view.offsets):
+            return None
+        zoom = (
+            self._source_nav_data["zoom"] if self._source_nav_data else self.zoom_level
+        )
+        return max(0, int(view.offsets[block["page"]] + block["y0"] * zoom) - 80)
+
+    def _step_source_match(self, delta: int) -> None:
+        """Move ▶◀ navigation by delta blocks: re-stamp the gold highlight on the
+        new current block and scroll the reference viewer to it."""
+        if not self._source_match_blocks:
             return
-        page_idx = self._source_match_pages[self._source_match_page_idx]
-        if page_idx < len(self.source_view.offsets):
-            self.source_scroll.verticalScrollBar().setValue(
-                int(self.source_view.offsets[page_idx])
-            )
-        n = len(self._source_match_pages)
+        n = len(self._source_match_blocks)
+        self._source_nav_index = (self._source_nav_index + delta) % n
+        block = self._source_match_blocks[self._source_nav_index]
+        self._apply_source_highlights(block["rect_keys"])
+        scroll_y = self._source_block_scroll_y(block)
+        if scroll_y is not None:
+            self.source_scroll.verticalScrollBar().setValue(scroll_y)
+        self.update_match_controls()
         self.status_bar.showMessage(
-            f"Reference match {self._source_match_page_idx + 1} of {n}", 3000
+            f"Reference match {self._source_nav_index + 1} of {n}", 3000
         )
 
     def prev_match(self):
-        if not self._source_match_pages:
-            return
-        self._source_match_page_idx = (self._source_match_page_idx - 1) % len(
-            self._source_match_pages
-        )
-        self._scroll_to_source_match()
-        self.update_match_controls()
+        self._step_source_match(-1)
 
     def next_match(self):
-        if not self._source_match_pages:
-            return
-        self._source_match_page_idx = (self._source_match_page_idx + 1) % len(
-            self._source_match_pages
-        )
-        self._scroll_to_source_match()
-        self.update_match_controls()
+        self._step_source_match(1)
 
     def load_current_match(self):
         if self.current_match_list:
@@ -1420,6 +1501,133 @@ class MainWindow(QMainWindow):
         self.current_match_list = []
         self.current_match_index = 0
         self.load_source_view(file_path, source_data=[])
+
+    def _apply_source_highlights(self, current_rect_keys: set) -> None:
+        """(Re)build the reference-viewer highlights from _source_nav_data.
+
+        Rects whose key is in *current_rect_keys* are stamped ``CURRENT_MATCH``
+        (gold, bordered); all others ``OTHER_MATCH`` (muted amber). Called on
+        every load and every ▶◀ navigation step so the active match is always
+        visibly marked.
+        """
+        nav = self._source_nav_data
+        if nav is None:
+            return
+        view = self.source_view
+        zoom = nav["zoom"]
+        rkeys_by_page = nav["rkeys_by_page"]
+        all_rect_objects = nav["all_rect_objects"]
+        target_data_by_ref_rect = nav["target_data_by_ref_rect"]
+
+        current_color = QColor(255, 180, 50, 110)  # gold
+        other_color = QColor(250, 170, 30, 40)  # amber-muted
+
+        def _merge_rects(rects):
+            if not rects:
+                return []
+            rects = sorted(rects, key=lambda r: (r.y0, r.x0))
+            merged = []
+            curr = rects[0]
+            for nxt in rects[1:]:
+                if (
+                    max(0, min(curr.y1, nxt.y1) - max(curr.y0, nxt.y0))
+                    > (curr.y1 - curr.y0) * 0.5
+                    and nxt.x0 - curr.x1 < 30
+                ):
+                    curr.x1 = max(curr.x1, nxt.x1)
+                else:
+                    merged.append(curr)
+                    curr = nxt
+            merged.append(curr)
+            return merged
+
+        # Build per-rect target preview data by finding which original
+        # rects overlap each merged rect (merging unions nearby rects,
+        # so we collect target triples from all constituents).
+        def _target_data_for_merged(merged_rect, rects_with_data):
+            """Collect target triples from original rects inside the merged rect."""
+            triples = []
+            for orig_r, orig_triples in rects_with_data:
+                if (
+                    orig_r.y0 >= merged_rect.y0 - 1
+                    and orig_r.y1 <= merged_rect.y1 + 1
+                    and orig_r.x0 >= merged_rect.x0 - 1
+                    and orig_r.x1 <= merged_rect.x1 + 1
+                ):
+                    triples.extend(orig_triples)
+            return triples
+
+        for slot_idx, lbl in enumerate(view.slots):
+            p_idx = lbl.page_index
+            page_rkeys = rkeys_by_page.get(p_idx, [])
+            page_highlight_data = [
+                (all_rect_objects[rkey], rkey in current_rect_keys)
+                for rkey in page_rkeys
+            ]
+
+            # IMPORTANT: copy rects before merging! _merge_rects mutates rects in-place
+            # (widening x1). The originals come from reference_maps, so mutating them
+            # would permanently corrupt the shared index and break future comparisons.
+            current_rects = [
+                fitz.Rect(r) for r, is_curr in page_highlight_data if is_curr
+            ]
+            other_rects = [
+                fitz.Rect(r) for r, is_curr in page_highlight_data if not is_curr
+            ]
+
+            merged_current = _merge_rects(current_rects)
+            merged_other = _merge_rects(other_rects)
+
+            highlights = []
+
+            # Pre-compute per-rect target data
+            current_rects_with_data = []
+            other_rects_with_data = []
+            for r, is_curr in page_highlight_data:
+                rkey = (p_idx, r.x0, r.y0, r.x1, r.y1)
+                triples = target_data_by_ref_rect.get(rkey, [])
+                if is_curr:
+                    current_rects_with_data.append((r, triples))
+                else:
+                    other_rects_with_data.append((r, triples))
+
+            for r in merged_other:
+                rect_triples = _target_data_for_merged(r, other_rects_with_data)
+                highlights.append(
+                    HighlightEntry(
+                        rect=fitz.Rect(
+                            r.x0 * zoom, r.y0 * zoom, r.x1 * zoom, r.y1 * zoom
+                        ),
+                        source="OTHER_MATCH",
+                        preview_source=self.current_target_file,
+                        source_data=rect_triples or None,
+                        match_id=id(r),
+                        confidence=0.3,
+                    )
+                )
+            for r in merged_current:
+                rect_triples = _target_data_for_merged(r, current_rects_with_data)
+                highlights.append(
+                    HighlightEntry(
+                        rect=fitz.Rect(
+                            r.x0 * zoom, r.y0 * zoom, r.x1 * zoom, r.y1 * zoom
+                        ),
+                        source="CURRENT_MATCH",
+                        preview_source=self.current_target_file,
+                        source_data=rect_triples or None,
+                        match_id=id(r),
+                        confidence=1.0,
+                    )
+                )
+
+            lbl.color_map = {
+                "OTHER_MATCH": other_color,
+                "CURRENT_MATCH": current_color,
+            }
+            lbl.highlights = highlights
+            lbl._hl_cache_key = None  # invalidate cached highlight pixmap
+            if view.slot_data[slot_idx]["materialized"]:
+                lbl.draw_highlights()
 
     def load_source_view(self, file_path, source_data):
         """
@@ -1481,29 +1689,7 @@ class MainWindow(QMainWindow):
             # Build all widgets with empty pixmaps + fixed sizes
             for page_idx, _page in enumerate(doc):
                 w_px, h_px = page_dims[page_idx]
-
-                if self.widget_pool:
-                    lbl = self.widget_pool.pop()
-                    try:
-                        lbl.matchesClicked.disconnect()
-                    except (TypeError, RuntimeError):
-                        pass
-                    try:
-                        lbl.matchIgnored.disconnect()
-                    except (TypeError, RuntimeError):
-                        pass
-                    try:
-                        lbl.matchPhraseIgnored.disconnect()
-                    except (TypeError, RuntimeError):
-                        pass
-                    lbl.original_pixmap = QPixmap()
-                    lbl.highlights = []
-                    lbl.color_map = {}
-                    lbl.setPixmap(QPixmap())
-                    lbl._hl_cache = None
-                    lbl._hl_cache_key = None
-                else:
-                    lbl = PDFPageLabel(QPixmap(), [], {})
+                lbl = self._checkout_page_label([])
 
                 lbl.page_index = page_idx
                 lbl.setFixedSize(int(w_px), int(h_px))
@@ -1524,9 +1710,6 @@ class MainWindow(QMainWindow):
         # Build highlights for all matches from this source
         zoom = self.zoom_level
 
-        current_color = QColor(255, 180, 50, 110)  # gold
-        other_color = QColor(250, 170, 30, 40)  # amber-muted
-
         # Keys identifying which reference rects belong to the actively-clicked match
         current_rect_keys: set = set()
         for ref_page, ref_rect, _ in source_data:
@@ -1537,11 +1720,6 @@ class MainWindow(QMainWindow):
         # the one that was clicked.
         # Also collect target-side data (page, rect, word) for each reference rect,
         # so hovering in the reference viewer can show a preview of the target text.
-        #
-        # IMPORTANT: Rect collection and is_current determination are separate steps.
-        # If done in a single pass, processing order can cause a shared rkey (from
-        # overlapping SW-expanded blocks) to be permanently stamped as non-current
-        # when a non-current block's target words are iterated before the current one.
         seen_rect_keys: set = set()
         # Map: rkey → fitz.Rect object (the first one seen, for dedup)
         all_rect_objects: dict = {}
@@ -1549,6 +1727,10 @@ class MainWindow(QMainWindow):
         rkeys_by_page: dict = {}
         # Map: ref_rect_key → list of (target_page, target_rect, word) triples
         target_data_by_ref_rect: dict = {}
+        # Per match block (match_id): its reference rects and topmost position,
+        # used by ▶◀ navigation to step through blocks and re-stamp the current one.
+        block_rkeys: dict = {}
+        block_pos: dict = {}
         for target_page_idx, page_highlights in self.current_results.items():
             for h in page_highlights:
                 if h.source != file_path or h.ignored:
@@ -1559,145 +1741,82 @@ class MainWindow(QMainWindow):
                     rkey = (ref_page, *ref_rect)
                     # Accumulate target data for each reference rect
                     target_data_by_ref_rect.setdefault(rkey, []).append(target_triple)
+                    if h.match_id is not None:
+                        block_rkeys.setdefault(h.match_id, set()).add(rkey)
+                        pos = (ref_page, ref_rect[1])
+                        if h.match_id not in block_pos or pos < block_pos[h.match_id]:
+                            block_pos[h.match_id] = pos
                     if rkey in seen_rect_keys:
                         continue
                     seen_rect_keys.add(rkey)
                     all_rect_objects[rkey] = fitz.Rect(ref_rect)
                     rkeys_by_page.setdefault(ref_page, []).append(rkey)
 
-        # Determine is_current purely from current_rect_keys (order-independent)
-        all_highlights_by_page: dict = {}
-        for ref_page, rkeys in rkeys_by_page.items():
-            all_highlights_by_page[ref_page] = [
-                (all_rect_objects[rkey], rkey in current_rect_keys) for rkey in rkeys
-            ]
+        # Always make the actively-shown rects available: alternate occurrences
+        # of a phrase are not part of any displayed best-match highlight, and in
+        # browse mode (no results yet) they are the only rects there are.
+        for ref_page, ref_rect, _ in source_data:
+            rkey = (ref_page, *ref_rect)
+            if rkey not in all_rect_objects:
+                all_rect_objects[rkey] = fitz.Rect(ref_rect)
+                rkeys_by_page.setdefault(ref_page, []).append(rkey)
 
-        # Fallback when there are no comparison results yet (e.g., browse mode
-        # before a comparison has been run).
-        if not all_highlights_by_page:
-            for ref_page, ref_rect, _ in source_data:
-                if ref_page not in all_highlights_by_page:
-                    all_highlights_by_page[ref_page] = []
-                all_highlights_by_page[ref_page].append((fitz.Rect(ref_rect), True))
+        # Stash everything highlight re-stamping needs so ▶◀ navigation can
+        # switch the current block without rescanning the results.
+        self._source_nav_data = {
+            "rkeys_by_page": rkeys_by_page,
+            "all_rect_objects": all_rect_objects,
+            "target_data_by_ref_rect": target_data_by_ref_rect,
+            "zoom": zoom,
+        }
 
-        # Build the reference-navigation index (sorted page list + initial position)
-        self._source_match_pages = sorted(all_highlights_by_page.keys())
-        if tp is not None and tp in self._source_match_pages:
-            self._source_match_page_idx = self._source_match_pages.index(tp)
-        else:
-            self._source_match_page_idx = 0
-
-        # When opened without a specific match (browse mode), scroll to first
-        # highlighted page instead of the top of the document.
-        scroll_page = (
-            tp
-            if tp is not None
-            else (self._source_match_pages[0] if self._source_match_pages else None)
-        )
-
-        def _merge_rects(rects):
-            if not rects:
-                return []
-            rects = sorted(rects, key=lambda r: (r.y0, r.x0))
-            merged = []
-            curr = rects[0]
-            for nxt in rects[1:]:
-                if (
-                    max(0, min(curr.y1, nxt.y1) - max(curr.y0, nxt.y0))
-                    > (curr.y1 - curr.y0) * 0.5
-                    and nxt.x0 - curr.x1 < 30
-                ):
-                    curr.x1 = max(curr.x1, nxt.x1)
-                else:
-                    merged.append(curr)
-                    curr = nxt
-            merged.append(curr)
-            return merged
-
-        for slot_idx, lbl in enumerate(view.slots):
-            p_idx = lbl.page_index
-            page_highlight_data = all_highlights_by_page.get(p_idx, [])
-
-            # IMPORTANT: copy rects before merging! _merge_rects mutates rects in-place
-            # (widening x1). The originals come from reference_maps, so mutating them
-            # would permanently corrupt the shared index and break future comparisons.
-            current_rects = [
-                fitz.Rect(r) for r, is_curr in page_highlight_data if is_curr
-            ]
-            other_rects = [
-                fitz.Rect(r) for r, is_curr in page_highlight_data if not is_curr
-            ]
-
-            merged_current = _merge_rects(current_rects)
-            merged_other = _merge_rects(other_rects)
-
-            highlights = []
-
-            # Build per-rect target preview data by finding which original
-            # rects overlap each merged rect (merging unions nearby rects,
-            # so we collect target triples from all constituents).
-            def _target_data_for_merged(merged_rect, rects_with_data):
-                """Collect target triples from original rects that overlap the merged rect."""
-                triples = []
-                for orig_r, orig_triples in rects_with_data:
-                    # Check if the original rect was merged into this merged rect
-                    if (
-                        orig_r.y0 >= merged_rect.y0 - 1
-                        and orig_r.y1 <= merged_rect.y1 + 1
-                        and orig_r.x0 >= merged_rect.x0 - 1
-                        and orig_r.x1 <= merged_rect.x1 + 1
-                    ):
-                        triples.extend(orig_triples)
-                return triples
-
-            # Pre-compute per-rect target data
-            current_rects_with_data = []
-            other_rects_with_data = []
-            for r, is_curr in page_highlight_data:
-                rkey = (p_idx, r.x0, r.y0, r.x1, r.y1)
-                triples = target_data_by_ref_rect.get(rkey, [])
-                if is_curr:
-                    current_rects_with_data.append((r, triples))
-                else:
-                    other_rects_with_data.append((r, triples))
-
-            for r in merged_other:
-                rect_triples = _target_data_for_merged(r, other_rects_with_data)
-                highlights.append(
-                    HighlightEntry(
-                        rect=fitz.Rect(
-                            r.x0 * zoom, r.y0 * zoom, r.x1 * zoom, r.y1 * zoom
-                        ),
-                        source="OTHER_MATCH",
-                        preview_source=self.current_target_file,
-                        source_data=rect_triples or None,
-                        match_id=id(r),
-                        confidence=0.3,
-                    )
-                )
-            for r in merged_current:
-                rect_triples = _target_data_for_merged(r, current_rects_with_data)
-                highlights.append(
-                    HighlightEntry(
-                        rect=fitz.Rect(
-                            r.x0 * zoom, r.y0 * zoom, r.x1 * zoom, r.y1 * zoom
-                        ),
-                        source="CURRENT_MATCH",
-                        preview_source=self.current_target_file,
-                        source_data=rect_triples or None,
-                        match_id=id(r),
-                        confidence=1.0,
-                    )
-                )
-
-            lbl.color_map = {
-                "OTHER_MATCH": other_color,
-                "CURRENT_MATCH": current_color,
+        # Navigable match blocks, ordered by position in the reference document.
+        self._source_match_blocks = [
+            {
+                "match_id": mid,
+                "page": pos[0],
+                "y0": pos[1],
+                "rect_keys": block_rkeys[mid],
             }
-            lbl.highlights = highlights
-            lbl._hl_cache_key = None  # invalidate cached highlight pixmap
-            if view.slot_data[slot_idx]["materialized"]:
-                lbl.draw_highlights()
+            for mid, pos in sorted(block_pos.items(), key=lambda kv: kv[1])
+        ]
+        clicked_mid = (
+            self.current_match_list[self.current_match_index].match_id
+            if self.current_match_list
+            else None
+        )
+        self._source_nav_index = next(
+            (
+                i
+                for i, b in enumerate(self._source_match_blocks)
+                if b["match_id"] == clicked_mid
+            ),
+            0,
+        )
+        # Browse mode (no clicked match): mark the first block as current so the
+        # gold highlight and the "Match 1 of N" counter agree from the start.
+        if not current_rect_keys and self._source_match_blocks:
+            current_rect_keys = self._source_match_blocks[0]["rect_keys"]
+
+        self._apply_source_highlights(current_rect_keys)
+
+        # Scroll target: the actively-shown rects (works for alternate
+        # occurrences that are not navigable blocks), else the current block,
+        # else the first highlighted page when browsing.
+        scroll_page = None
+        scroll_y = None
+        if tp is not None and tp < len(view.offsets):
+            y0 = min(r[1] for p, r, _ in source_data if p == tp)
+            scroll_page = tp
+            scroll_y = max(0, int(view.offsets[tp] + y0 * zoom) - 80)
+        elif self._source_match_blocks:
+            block = self._source_match_blocks[self._source_nav_index]
+            scroll_page = block["page"]
+            scroll_y = self._source_block_scroll_y(block)
+        elif rkeys_by_page:
+            scroll_page = min(rkeys_by_page)
+            if scroll_page < len(view.offsets):
+                scroll_y = int(view.offsets[scroll_page])
 
         # Materialize visible source pages (first load or after highlight refresh)
         QTimer.singleShot(
@@ -1735,14 +1854,15 @@ class MainWindow(QMainWindow):
             self.source_text_edit.setExtraSelections(extra)
 
         # Scroll with delay to ensure container height is applied
-        if scroll_page is not None and scroll_page < len(view.offsets):
-            scroll_y = int(view.offsets[scroll_page])
+        if scroll_y is not None:
 
             def _scroll_source():
                 view.scroll_to_if_current(scroll_y, file_path, render_epoch)
 
             QTimer.singleShot(50, _scroll_source)
-            if not getattr(self, "_source_text_dirty", True):
+            if scroll_page is not None and not getattr(
+                self, "_source_text_dirty", True
+            ):
                 hdr_to_find = f"--- Page {scroll_page + 1} ---"
                 cursor = self.source_text_edit.document().find(hdr_to_find)
                 if not cursor.isNull():
@@ -1767,6 +1887,10 @@ class MainWindow(QMainWindow):
                 return
             elif event.key() == Qt.Key.Key_Minus:
                 self.change_zoom(-0.1)
+                event.accept()
+                return
+            elif event.key() == Qt.Key.Key_0:
+                self.reset_zoom()
                 event.accept()
                 return
         super().keyPressEvent(event)

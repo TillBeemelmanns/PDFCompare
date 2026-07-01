@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
@@ -320,13 +321,14 @@ class FileListWidget(QListWidget):
             self._show_invalid_feedback()
             event.ignore()
         else:
+            existing = set(self.get_files())
             added = 0
             for url in event.mimeData().urls():
                 file_path = url.toLocalFile()
                 pdfs = self._find_pdfs_recursive(file_path)
                 for pdf_path in pdfs:
-                    existing = [self.item(i).text() for i in range(self.count())]
                     if pdf_path not in existing:
+                        existing.add(pdf_path)
                         self.addItem(pdf_path)
                         added += 1
 
@@ -339,6 +341,43 @@ class FileListWidget(QListWidget):
 
     def get_files(self):
         return [self.item(i).text() for i in range(self.count())]
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        """Double-click opens a file browser as an alternative to drag-and-drop."""
+        if self.single_file:
+            path, _ = QFileDialog.getOpenFileName(
+                self, f"Select {self.title} PDF", "", "PDF Files (*.pdf)"
+            )
+            if path:
+                self.clear()
+                self.addItem(path)
+                self.files_changed.emit()
+        else:
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, f"Select {self.title} PDFs", "", "PDF Files (*.pdf)"
+            )
+            existing = set(self.get_files())
+            added = 0
+            for path in paths:
+                if path and path not in existing:
+                    existing.add(path)
+                    self.addItem(path)
+                    added += 1
+            if added:
+                self.files_changed.emit()
+
+    def keyPressEvent(self, event) -> None:
+        """Delete/Backspace removes the selected entries."""
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            removed = False
+            for item in self.selectedItems():
+                self.takeItem(self.row(item))
+                removed = True
+            if removed:
+                self.files_changed.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def paintEvent(self, event):
         """Override to show placeholder when empty."""
@@ -356,9 +395,12 @@ class FileListWidget(QListWidget):
 
             rect = self.viewport().rect()
             if self.single_file:
-                text = f"Drop {self.title} PDF here"
+                text = f"Drop {self.title} PDF here\nor double-click to browse"
             else:
-                text = f"Drop {self.title} PDF(s) here\nor drag folders"
+                text = (
+                    f"Drop {self.title} PDF(s) or folders here\n"
+                    "or double-click to browse"
+                )
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
             painter.end()
@@ -670,8 +712,14 @@ class PDFPageLabel(QLabel):
             painter.setBrush(color)
             qrect = QRectF(rect.x0, rect.y0, rect.width, rect.height)
 
+            # The active match in the reference viewer gets a gold border so it
+            # is unmistakable among the muted "other match" highlights.
+            if source == "CURRENT_MATCH":
+                pen = QPen(QColor(255, 180, 50, 230))
+                pen.setWidth(2)
+                painter.setPen(pen)
             # Red-tier matches always get a visible border
-            if confidence >= 0.8 and source not in self.color_map:
+            elif confidence >= 0.8 and source not in self.color_map:
                 border_color = QColor(243, 139, 168, 180)
                 pen = QPen(border_color)
                 pen.setWidth(2)

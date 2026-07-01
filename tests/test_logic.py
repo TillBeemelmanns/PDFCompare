@@ -112,6 +112,86 @@ class TestPDFComparator(unittest.TestCase):
             stats_lenient.get(self.ref1_path, 0), stats_strict.get(self.ref1_path, 0)
         )
 
+    def test_fuzzy_mode_with_stopword_offsets(self):
+        """Fuzzy matching must use filtered word positions, not raw indices.
+
+        Regression test: word_index used to store the original (pre-filter)
+        word index, so any stopwords preceding a phrase shifted the candidate
+        positions and silently dropped fuzzy matches.
+        """
+        ref_path = "tests/fuzzy_ref.pdf"
+        tgt_path = "tests/fuzzy_target.pdf"
+        # Leading stopwords ("it is a ... that a") desynchronize original vs
+        # filtered indices for everything that follows.
+        phrase = (
+            "It is a truth universally acknowledged that a single gentleman "
+            "possessing considerable fortune must want a spouse."
+        )
+        doc = fitz.open()
+        doc.new_page().insert_text((50, 50), phrase)
+        doc.save(ref_path)
+        doc.close()
+
+        doc = fitz.open()
+        doc.new_page().insert_text((50, 50), "As they say: " + phrase)
+        doc.save(tgt_path)
+        doc.close()
+
+        try:
+            self.comparator.add_references([ref_path])
+            _, _, stats = self.comparator.compare_document(tgt_path, mode="fuzzy")
+            self.assertIn(ref_path, stats)
+            # "truth universally acknowledged single gentleman possessing
+            # considerable fortune must want spouse" — 11 content words
+            self.assertGreaterEqual(stats[ref_path], 8)
+        finally:
+            os.remove(ref_path)
+            os.remove(tgt_path)
+
+    def test_alt_matches_for_repeated_reference_phrase(self):
+        """A phrase occurring twice in a reference must yield alt_matches.
+
+        Also exercises the parallel-chain merger: interleaved raw matches from
+        two source occurrences must form two clean blocks, not fragments.
+        """
+        ref_path = "tests/alt_ref.pdf"
+        tgt_path = "tests/alt_target.pdf"
+        phrase = (
+            "Sustainable aquaculture requires careful monitoring of dissolved "
+            "oxygen temperature salinity and nutrient concentrations daily."
+        )
+        doc = fitz.open()
+        doc.new_page().insert_text((50, 100), phrase)
+        doc.new_page().insert_text((50, 300), phrase)  # second occurrence, page 1
+        doc.save(ref_path)
+        doc.close()
+
+        doc = fitz.open()
+        doc.new_page().insert_text((50, 100), phrase)
+        doc.save(tgt_path)
+        doc.close()
+
+        try:
+            self.comparator.add_references([ref_path])
+            results, _, stats = self.comparator.compare_document(tgt_path)
+            self.assertIn(ref_path, stats)
+
+            entries = [e for page in results.values() for e in page]
+            self.assertTrue(entries)
+            with_alts = [e for e in entries if e.alt_matches]
+            self.assertTrue(
+                with_alts, "Expected alt_matches for a phrase duplicated in the ref"
+            )
+            # The alternate must point at a different reference location
+            # (compare page+rect keys — SW expansion can make page sets overlap)
+            entry = with_alts[0]
+            primary_locs = {(p, r) for p, r, _ in entry.source_data}
+            alt_locs = {(p, r) for p, r, _ in entry.alt_matches[0]["source_data"]}
+            self.assertNotEqual(primary_locs, alt_locs)
+        finally:
+            os.remove(ref_path)
+            os.remove(tgt_path)
+
     def test_dehyphenation_logic(self):
         """Verify that split words are correctly merged."""
         # We manually call the internal helper with split words

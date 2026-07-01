@@ -4,9 +4,11 @@ import unittest
 
 import fitz
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from gui.pdf_renderer import _page_pixel_size
+from gui.pdf_renderer import _page_pixel_size, PixmapCache
 
 
 class TestPagePixelSize(unittest.TestCase):
@@ -50,6 +52,44 @@ class TestPagePixelSize(unittest.TestCase):
             )
         finally:
             doc.close()
+
+
+class TestPixmapCache(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication(sys.argv)
+
+    def _pixmap(self, w: int, h: int):
+        from PyQt6.QtGui import QPixmap
+
+        pm = QPixmap(w, h)
+        pm.fill()
+        return pm
+
+    def test_put_replaces_existing_entry(self):
+        cache = PixmapCache()
+        key = ("f.pdf", 0, 1.0)
+        cache.put(key, self._pixmap(10, 10))
+        replacement = self._pixmap(20, 20)
+        cache.put(key, replacement)
+
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.get(key).width(), 20)
+        self.assertEqual(cache.used_bytes, 20 * 20 * 4)
+
+    def test_lru_eviction_respects_byte_budget(self):
+        cache = PixmapCache(max_bytes=2 * 10 * 10 * 4)
+        cache.put(("f.pdf", 0, 1.0), self._pixmap(10, 10))
+        cache.put(("f.pdf", 1, 1.0), self._pixmap(10, 10))
+        cache.get(("f.pdf", 0, 1.0))  # promote page 0 to MRU
+        cache.put(("f.pdf", 2, 1.0), self._pixmap(10, 10))
+
+        self.assertIsNone(cache.get(("f.pdf", 1, 1.0)))  # LRU evicted
+        self.assertIsNotNone(cache.get(("f.pdf", 0, 1.0)))
+        self.assertIsNotNone(cache.get(("f.pdf", 2, 1.0)))
+        self.assertEqual(cache.used_bytes, 2 * 10 * 10 * 4)
 
 
 if __name__ == "__main__":

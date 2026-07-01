@@ -62,7 +62,11 @@ class TestTargetScrollRegression(unittest.TestCase):
             self._wait(step_ms)
         return predicate()
 
-    def _send_wheel(self, angle_delta_y: int = -960) -> None:
+    def _send_wheel(
+        self,
+        angle_delta_y: int = -960,
+        modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
+    ) -> None:
         viewport = self.window.target_scroll.viewport()
         center = viewport.rect().center()
         pos = QPointF(center)
@@ -73,7 +77,7 @@ class TestTargetScrollRegression(unittest.TestCase):
             QPoint(0, 0),
             QPoint(0, angle_delta_y),
             Qt.MouseButton.NoButton,
-            Qt.KeyboardModifier.NoModifier,
+            modifiers,
             Qt.ScrollPhase.ScrollUpdate,
             False,
         )
@@ -127,10 +131,16 @@ class TestTargetScrollRegression(unittest.TestCase):
         bar.setValue(max(int(bar.maximum() * 0.45), 1))
         self._wait(50)
 
-        expected_anchor = self.window.target_view.capture_scroll_anchor()
-        self.assertIsNotNone(expected_anchor)
+        old_anchor = self.window.target_view.capture_scroll_anchor()
+        self.assertIsNotNone(old_anchor)
+        old_zoom = self.window.zoom_level
 
-        self.window.zoom_level = 1.8
+        # The pixel offset within the anchor page must scale with zoom so the
+        # same document position stays at the top of the viewport.
+        new_zoom = 1.8
+        expected_anchor = (old_anchor[0], int(old_anchor[1] * new_zoom / old_zoom))
+
+        self.window.zoom_level = new_zoom
         self.window.render_target(self.pdf_path, {}, restore_scroll=bar.value())
 
         self.assertTrue(
@@ -140,6 +150,20 @@ class TestTargetScrollRegression(unittest.TestCase):
                 )
             )
         )
+
+    def test_ctrl_wheel_over_viewport_zooms_instead_of_scrolling(self):
+        self._render_target()
+
+        bar = self.window.target_scroll.verticalScrollBar()
+        zoom_before = self.window.zoom_level
+        scroll_before = bar.value()
+
+        self._send_wheel(960, Qt.KeyboardModifier.ControlModifier)
+        self.assertAlmostEqual(self.window.zoom_level, zoom_before + 0.1)
+        self.assertEqual(bar.value(), scroll_before)
+
+        self._send_wheel(-960, Qt.KeyboardModifier.ControlModifier)
+        self.assertAlmostEqual(self.window.zoom_level, zoom_before)
 
     def test_target_wheel_scroll_does_not_snap_back_during_async_render(self):
         original_run = PageRenderWorker.run
